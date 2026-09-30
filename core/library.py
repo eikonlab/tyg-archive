@@ -1,7 +1,30 @@
 import os
+import random
+import subprocess
+import json
 from core.config import load_config, save_config
 
 VALID_EXTENSIONS = {".mp4", ".mov", ".mkv", ".jpg", ".jpeg", ".png", ".wav"}
+
+# Extensions vidéo pour lesquelles on génère des IN/OUT aléatoires
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv"}
+
+
+def _get_video_duration(filepath):
+    """Récupère la durée d'une vidéo en secondes via ffprobe (si disponible)."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", filepath],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            data = json.loads(result.stdout)
+            duration = float(data.get("format", {}).get("duration", 0))
+            return duration
+    except (FileNotFoundError, subprocess.TimeoutExpired, json.JSONDecodeError, ValueError):
+        pass
+    return 0.0
+
 
 def scan_library(root_path):
     years_data = {}
@@ -30,6 +53,10 @@ def scan_library(root_path):
                             "out_point": 0.0,
                             "midi_note": None
                         })
+                        
+            # Trier les fichiers par nom alphabétique dans chaque année
+            years_data[year_dir].sort(key=lambda f: os.path.basename(f["filepath"]).lower())
+            
     return years_data
 
 def sync_library(root_path):
@@ -58,12 +85,43 @@ def sync_library(root_path):
     return existing_years
 
 def auto_assign_midi(year):
+    """Auto-assigne les notes MIDI et randomise les IN/OUT pour les vidéos."""
     config = load_config()
-    if year in config["years"]:
-        note = 36 # Start at C1
-        for f in config["years"][year]:
-            f["midi_note"] = note
-            note += 1
-            if note > 127:
-                break
-        save_config(config)
+    if year not in config["years"]:
+        return
+        
+    print(f"[Library] Auto-assign MIDI pour {year} ({len(config['years'][year])} fichiers)")
+    
+    note = 36  # Start at C1
+    for f in config["years"][year]:
+        f["midi_note"] = note
+        note += 1
+        if note > 127:
+            break
+        
+        # Randomiser les IN/OUT pour les vidéos
+        ext = os.path.splitext(f["filepath"])[1].lower()
+        if ext in VIDEO_EXTENSIONS:
+            duration = _get_video_duration(f["filepath"])
+            if duration > 10:
+                # IN point : position aléatoire dans les premiers 80% du clip
+                # pour laisser au moins 20% de clip à jouer
+                max_in = duration * 0.8
+                in_point = round(random.uniform(0, max_in), 1)
+                
+                # OUT point : entre le in_point + 5s et la fin du clip
+                min_out = min(in_point + 5.0, duration)
+                out_point = round(random.uniform(min_out, duration), 1)
+                
+                f["in_point"] = in_point
+                f["out_point"] = out_point
+                print(f"  {os.path.basename(f['filepath'])}: IN={in_point}s OUT={out_point}s (durée={duration:.0f}s)")
+            elif duration > 0:
+                # Clip court : on garde le début mais avec un out aléatoire
+                f["in_point"] = 0.0
+                f["out_point"] = round(random.uniform(duration * 0.3, duration), 1)
+                print(f"  {os.path.basename(f['filepath'])}: clip court, IN=0 OUT={f['out_point']}s")
+            else:
+                print(f"  {os.path.basename(f['filepath'])}: durée inconnue (ffprobe indisponible?)")
+    
+    save_config(config)

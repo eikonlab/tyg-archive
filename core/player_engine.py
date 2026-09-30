@@ -4,7 +4,7 @@ import time
 import vlc
 from PyQt5.QtWidgets import QWidget, QLabel
 from PyQt5.QtCore import QRect, QTimer, Qt
-from PyQt5.QtGui import QPixmap
+from PyQt5.QtGui import QPixmap, QScreen
 import random
 
 
@@ -13,6 +13,9 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tiff", ".tif", ".
 # Extensions reconnues comme vidéo/audio (affichées via VLC)
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".wmv", ".flv", ".webm", ".m4v",
                     ".mpg", ".mpeg", ".wav", ".mp3", ".aac", ".flac", ".ogg"}
+
+# Nombre max de frames figées visibles à l'écran (mosaïque)
+MAX_FROZEN_FRAMES = 20
 
 
 def _log(tag, msg):
@@ -54,55 +57,26 @@ def _is_image(filepath):
     return ext in IMAGE_EXTENSIONS
 
 
-class ImageLayer:
-    """Couche d'affichage pour les images, utilise Qt QPixmap (rapide, pas de VLC)."""
+class FrozenFrame:
+    """Un QLabel qui affiche une frame figée (screenshot d'une vidéo ou image)."""
     
-    def __init__(self, parent_widget, layer_id=0):
-        self.layer_id = layer_id
+    def __init__(self, parent_widget, frame_id=0):
+        self.frame_id = frame_id
         self.label = QLabel(parent_widget)
         self.label.setStyleSheet("background-color: black;")
-        self.label.setAlignment(Qt.AlignCenter)
         self.label.setScaledContents(True)
         self.label.hide()
-        self.media_path = None
-        self._play_request_time = None
         
-    def play(self, filepath, max_w=1920, max_h=1080):
-        tag = f"ImgLayer-{self.layer_id}"
-        self._play_request_time = time.time()
-        self.media_path = filepath
-        
-        basename = os.path.basename(filepath)
-        _log(tag, f"🖼 IMAGE demandée: {basename}")
-        
-        t0 = time.time()
-        pixmap = QPixmap(filepath)
-        dt_load = (time.time() - t0) * 1000
-        
-        if pixmap.isNull():
-            _log(tag, f"  ⚠ Impossible de charger l'image !")
-            return
-        
-        orig_w, orig_h = pixmap.width(), pixmap.height()
-        _log(tag, f"  Chargée en {dt_load:.0f} ms — {orig_w}x{orig_h}")
-        
-        # Réduire l'image à la taille d'affichage pour économiser la RAM
-        if orig_w > max_w or orig_h > max_h:
-            t0 = time.time()
-            pixmap = pixmap.scaled(max_w, max_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            dt_scale = (time.time() - t0) * 1000
-            _log(tag, f"  ↓ Réduite à {pixmap.width()}x{pixmap.height()} en {dt_scale:.0f} ms (économie RAM)")
-        
+    def show_pixmap(self, pixmap, geometry):
+        """Affiche un pixmap figé à la position donnée."""
+        self.label.setGeometry(geometry)
         self.label.setPixmap(pixmap)
         self.label.show()
-    
-    def stop(self):
-        if self.media_path:
-            _log(f"ImgLayer-{self.layer_id}", f"⏹ STOP image: {os.path.basename(self.media_path)}")
+        
+    def hide(self):
         self.label.hide()
         self.label.clear()
-        self.media_path = None
-        
+    
     def set_geometry(self, x, y, w, h):
         self.label.setGeometry(QRect(x, y, w, h))
         
@@ -134,6 +108,17 @@ class SingleVideoPlayer:
         self._widget.hide()
         self.media_path = None
         self._play_request_time = None
+        self._parent_widget = parent_widget
+        
+    def grab_frame(self):
+        """Capture la frame actuelle du widget VLC comme QPixmap."""
+        if not self._widget.isVisible():
+            return None
+        # grab() capture le contenu rendu du widget
+        pixmap = self._widget.grab()
+        if pixmap.isNull():
+            return None
+        return pixmap
         
     def play(self, filepath, in_point=0.0):
         tag = "Video"
@@ -161,8 +146,6 @@ class SingleVideoPlayer:
         self.media_path = filepath
         
         # --- Changement de media SANS stop() ---
-        # On ne fait PAS player.stop(). On remplace directement le media.
-        # VLC gère internalement la transition sans crash.
         t0 = time.time()
         media = self.player.get_instance().media_new(filepath)
         media.add_option(f"start-time={in_point}")
@@ -238,8 +221,6 @@ class SingleVideoPlayer:
 
 
 class PlayerEngine:
-    NUM_IMAGE_LAYERS = 3
-    
     def __init__(self, parent_widget):
         # VLC : désactivation de l'accélération matérielle.
         vlc_args = [
@@ -254,22 +235,60 @@ class PlayerEngine:
         # UN SEUL player vidéo VLC (réutilisé, jamais stop(), juste set_media)
         self.video_player = SingleVideoPlayer(self.vlc_instance, parent_widget)
         
-        # Layers image (Qt, légers)
-        self.image_layers = [ImageLayer(parent_widget, i) for i in range(self.NUM_IMAGE_LAYERS)]
-        self.current_image_idx = 0
+        # Pool de frames figées (mosaïque de screenshots)
+        self.frozen_frames = [FrozenFrame(parent_widget, i) for i in range(MAX_FROZEN_FRAMES)]
+        self.current_frozen_idx = 0
+        
         self.parent_widget = parent_widget
         
         # Référence au dernier layer utilisé (pour les CC MIDI scale/pos)
         self._last_active_layer = None
         self._last_active_is_video = False
         
-        _log("Engine", f"1 video player (réutilisé) + {self.NUM_IMAGE_LAYERS} image layers créés")
-        _log("Engine", f"✅ Pas de player.stop() = pas de crash VLC")
+        _log("Engine", f"1 video player + {MAX_FROZEN_FRAMES} frozen frames créés")
+        _log("Engine", f"✅ Mosaïque: chaque nouveau clip fige l'ancien en image statique")
         
         # Timer pour vérifier l'état du player VLC après un play
         self._state_check_timer = QTimer()
         self._state_check_timer.timeout.connect(self._check_states)
         self._pending_check_times = []
+        
+    def _freeze_current_video(self):
+        """Capture la frame actuelle de la vidéo et la fige comme image statique."""
+        if not self.video_player.widget.isVisible():
+            return
+            
+        pixmap = self.video_player.grab_frame()
+        if pixmap is None or pixmap.isNull():
+            _log("Engine", "  ❄ Pas de frame à figer (widget vide)")
+            return
+            
+        # Récupérer la géométrie actuelle du player vidéo
+        geometry = self.video_player.widget.geometry()
+        
+        # Placer la frame figée dans le pool (round-robin)
+        frozen = self.frozen_frames[self.current_frozen_idx]
+        frozen.show_pixmap(pixmap, geometry)
+        
+        _log("Engine", f"  ❄ Frame figée → FrozenFrame-{self.current_frozen_idx} ({geometry.width()}x{geometry.height()})")
+        
+        self.current_frozen_idx = (self.current_frozen_idx + 1) % len(self.frozen_frames)
+        
+    def _freeze_current_image(self, image_layer):
+        """Fige l'image actuelle en tant que frozen frame pour libérer l'ImageLayer."""
+        if not image_layer.widget.isVisible() or not image_layer.media_path:
+            return
+            
+        pixmap = image_layer.label.pixmap()
+        if pixmap is None or pixmap.isNull():
+            return
+            
+        geometry = image_layer.widget.geometry()
+        frozen = self.frozen_frames[self.current_frozen_idx]
+        frozen.show_pixmap(pixmap, geometry)
+        
+        _log("Engine", f"  ❄ Image figée → FrozenFrame-{self.current_frozen_idx}")
+        self.current_frozen_idx = (self.current_frozen_idx + 1) % len(self.frozen_frames)
         
     def play_media(self, filepath, in_point=0.0):
         t0 = time.time()
@@ -287,18 +306,48 @@ class PlayerEngine:
         
         if _is_image(filepath):
             # --- AFFICHAGE IMAGE via Qt ---
-            _log("Engine", f"play_media() IMAGE — ImgLayer {self.current_image_idx}")
-            layer = self.image_layers[self.current_image_idx]
-            layer.stop()
-            layer.set_geometry(x, y, w, h)
-            layer.play(filepath)
-            layer.widget.raise_()
-            self._last_active_layer = layer
-            self._last_active_is_video = False
-            self.current_image_idx = (self.current_image_idx + 1) % len(self.image_layers)
+            _log("Engine", f"play_media() IMAGE")
+            
+            # Figer la vidéo en cours si visible
+            self._freeze_current_video()
+            
+            # Créer un frozen frame directement pour l'image
+            basename = os.path.basename(filepath)
+            _log("Engine", f"  🖼 Chargement: {basename}")
+            
+            t_load = time.time()
+            pixmap = QPixmap(filepath)
+            dt_load = (time.time() - t_load) * 1000
+            
+            if pixmap.isNull():
+                _log("Engine", f"  ⚠ Impossible de charger l'image !")
+            else:
+                orig_w, orig_h = pixmap.width(), pixmap.height()
+                _log("Engine", f"  Chargée en {dt_load:.0f} ms — {orig_w}x{orig_h}")
+                
+                # Réduire pour économiser la RAM
+                if orig_w > 1920 or orig_h > 1080:
+                    pixmap = pixmap.scaled(1920, 1080, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    _log("Engine", f"  ↓ Réduite à {pixmap.width()}x{pixmap.height()}")
+                
+                # Placer dans le pool de frozen frames
+                frozen = self.frozen_frames[self.current_frozen_idx]
+                frozen.show_pixmap(pixmap, QRect(x, y, w, h))
+                frozen.label.raise_()
+                self._last_active_layer = frozen
+                self._last_active_is_video = False
+                
+                _log("Engine", f"  → FrozenFrame-{self.current_frozen_idx}")
+                self.current_frozen_idx = (self.current_frozen_idx + 1) % len(self.frozen_frames)
+            
         else:
-            # --- LECTURE VIDEO via VLC (un seul player, réutilisé) ---
+            # --- LECTURE VIDEO via VLC ---
             _log("Engine", f"play_media() VIDEO")
+            
+            # 1. Figer la frame actuelle de la vidéo en cours
+            self._freeze_current_video()
+            
+            # 2. Déplacer le player VLC à la nouvelle position et jouer le nouveau clip
             self.video_player.set_geometry(x, y, w, h)
             self.video_player.play(filepath, in_point)
             self.video_player.widget.raise_()

@@ -24,7 +24,7 @@ class PrepMode(QWidget):
         left_panel.addWidget(self.btn_scan)
         
         self.list_years = QListWidget()
-        self.list_years.addItems(self.config.get("years", {}).keys())
+        self.list_years.addItems(sorted(self.config.get("years", {}).keys()))
         self.list_years.itemSelectionChanged.connect(self.on_year_selected)
         left_panel.addWidget(QLabel("Années:"))
         left_panel.addWidget(self.list_years)
@@ -67,7 +67,7 @@ class PrepMode(QWidget):
             sync_library(folder)
             self.config = load_config()
             self.list_years.clear()
-            self.list_years.addItems(self.config.get("years", {}).keys())
+            self.list_years.addItems(sorted(self.config.get("years", {}).keys()))
             QMessageBox.information(self, "Scan terminé", "La librairie a été mise à jour.")
             self.table.setRowCount(0)
             self.current_year = None
