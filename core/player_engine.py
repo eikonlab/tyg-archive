@@ -37,7 +37,9 @@ class PlayerLayer:
 
 class PlayerEngine:
     def __init__(self, parent_widget, num_layers=3):
-        self.vlc_instance = vlc.Instance("--no-xlib", "--avcodec-hw=any")
+        # On désactive l'accélération matérielle (--avcodec-hw=none) 
+        # car VideoToolbox fait souvent planter VLC sur les anciens macOS.
+        self.vlc_instance = vlc.Instance("--no-xlib", "--avcodec-hw=none")
         self.layers = [PlayerLayer(self.vlc_instance, parent_widget) for _ in range(num_layers)]
         self.current_layer_idx = 0
         self.parent_widget = parent_widget
