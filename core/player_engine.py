@@ -66,7 +66,6 @@ class ImageLayer:
         self.label.hide()
         self.media_path = None
         self._play_request_time = None
-        self._is_image_layer = True
         
     def play(self, filepath, max_w=1920, max_h=1080):
         tag = f"ImgLayer-{self.layer_id}"
@@ -88,7 +87,6 @@ class ImageLayer:
         _log(tag, f"  Chargée en {dt_load:.0f} ms — {orig_w}x{orig_h}")
         
         # Réduire l'image à la taille d'affichage pour économiser la RAM
-        # (une image 3849x5731 = ~88 MB en RAM, réduite à 1920x1080 = ~8 MB)
         if orig_w > max_w or orig_h > max_h:
             t0 = time.time()
             pixmap = pixmap.scaled(max_w, max_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
@@ -113,11 +111,15 @@ class ImageLayer:
         return self.label
 
 
-class VideoLayer:
-    """Couche d'affichage pour les vidéos/audio, utilise VLC."""
+class SingleVideoPlayer:
+    """Un seul player VLC réutilisé pour toutes les vidéos.
     
-    def __init__(self, vlc_instance, parent_widget, layer_id=0):
-        self.layer_id = layer_id
+    On évite de créer/détruire des players VLC car player.stop() 
+    provoque un crash (SIGTERM) sur les vieux macOS (High Sierra).
+    À la place, on change simplement le media du player existant.
+    """
+    
+    def __init__(self, vlc_instance, parent_widget):
         self._widget = QWidget(parent_widget)
         self._widget.setStyleSheet("background-color: black;")
         self.player = vlc_instance.media_player_new()
@@ -132,17 +134,17 @@ class VideoLayer:
         self._widget.hide()
         self.media_path = None
         self._play_request_time = None
-        self._is_image_layer = False
         
     def play(self, filepath, in_point=0.0):
-        tag = f"VidLayer-{self.layer_id}"
+        tag = "Video"
         self._play_request_time = time.time()
-        self.media_path = filepath
         
         # --- Info fichier ---
         size_mb, ext = _file_info(filepath)
         basename = os.path.basename(filepath)
+        old_media = os.path.basename(self.media_path) if self.media_path else "aucun"
         _log(tag, f"▶ VIDEO demandée: {basename}")
+        _log(tag, f"  (remplace: {old_media})")
         _log(tag, f"  Chemin complet: {filepath}")
         if size_mb >= 0:
             _log(tag, f"  Taille: {size_mb:.1f} MB | Extension: {ext}")
@@ -156,16 +158,19 @@ class VideoLayer:
         elif speed_mb < 0:
             _log(tag, f"  ⚠ Erreur lecture disque !")
         
-        # --- Création du media VLC ---
+        self.media_path = filepath
+        
+        # --- Changement de media SANS stop() ---
+        # On ne fait PAS player.stop(). On remplace directement le media.
+        # VLC gère internalement la transition sans crash.
         t0 = time.time()
         media = self.player.get_instance().media_new(filepath)
         media.add_option(f"start-time={in_point}")
-        # Forcer le décodage software par media aussi
         media.add_option(":avcodec-hw=none")
         media.add_option(":no-videotoolbox")
         self.player.set_media(media)
         dt_media = (time.time() - t0) * 1000
-        _log(tag, f"  Media VLC créé en {dt_media:.0f} ms (in_point={in_point})")
+        _log(tag, f"  Media VLC remplacé en {dt_media:.0f} ms (in_point={in_point})")
         
         # --- Lancement lecture ---
         t0 = time.time()
@@ -175,10 +180,8 @@ class VideoLayer:
         
         self._widget.show()
         
-    def stop(self):
-        if self.media_path:
-            _log(f"VidLayer-{self.layer_id}", f"⏹ STOP vidéo: {os.path.basename(self.media_path)}")
-        self.player.stop()
+    def hide(self):
+        """Cache le widget vidéo sans appeler player.stop()."""
         self._widget.hide()
         
     def set_geometry(self, x, y, w, h):
@@ -190,7 +193,7 @@ class VideoLayer:
 
     def check_playback_state(self):
         """Vérifie l'état du player VLC et logge les infos."""
-        tag = f"VidLayer-{self.layer_id}"
+        tag = "Video"
         state = self.player.get_state()
         state_names = {
             vlc.State.NothingSpecial: "NothingSpecial",
@@ -216,10 +219,6 @@ class VideoLayer:
                 duration = self.player.get_length()
                 position = self.player.get_time()
                 _log(tag, f"  Position: {position} ms / {duration} ms")
-                
-                tracks = self.player.video_get_track_description()
-                if tracks:
-                    _log(tag, f"  Pistes vidéo: {[(t[0], t[1].decode() if isinstance(t[1], bytes) else t[1]) for t in tracks]}")
                     
                 vw = self.player.video_get_width()
                 vh = self.player.video_get_height()
@@ -239,43 +238,38 @@ class VideoLayer:
 
 
 class PlayerEngine:
-    # Max 2 vidéos VLC simultanées pour limiter la RAM sur les vieux Mac
-    MAX_VIDEO_LAYERS = 2
-    # 3 layers images (légers grâce au downscale)
-    MAX_IMAGE_LAYERS = 3
+    NUM_IMAGE_LAYERS = 3
     
-    def __init__(self, parent_widget, num_video_layers=None, num_image_layers=None):
-        num_video_layers = num_video_layers or self.MAX_VIDEO_LAYERS
-        num_image_layers = num_image_layers or self.MAX_IMAGE_LAYERS
-        
+    def __init__(self, parent_widget):
         # VLC : désactivation de l'accélération matérielle.
         vlc_args = [
             "--no-xlib",
-            "--avcodec-hw=none",        # Désactive le décodage HW générique
-            "--no-videotoolbox",        # Désactive spécifiquement VideoToolbox (macOS)
-            "--verbose=0",              # Réduit les logs VLC (passer à 1 pour debug)
+            "--avcodec-hw=none",
+            "--no-videotoolbox",
+            "--verbose=0",
         ]
         _log("Engine", f"Initialisation VLC avec args: {vlc_args}")
         self.vlc_instance = vlc.Instance(*vlc_args)
         
-        # Layers vidéo (VLC) et image (Qt) séparés
-        self.video_layers = [VideoLayer(self.vlc_instance, parent_widget, i) for i in range(num_video_layers)]
-        self.image_layers = [ImageLayer(parent_widget, i) for i in range(num_image_layers)]
+        # UN SEUL player vidéo VLC (réutilisé, jamais stop(), juste set_media)
+        self.video_player = SingleVideoPlayer(self.vlc_instance, parent_widget)
         
-        self.current_video_idx = 0
+        # Layers image (Qt, légers)
+        self.image_layers = [ImageLayer(parent_widget, i) for i in range(self.NUM_IMAGE_LAYERS)]
         self.current_image_idx = 0
         self.parent_widget = parent_widget
         
         # Référence au dernier layer utilisé (pour les CC MIDI scale/pos)
         self._last_active_layer = None
+        self._last_active_is_video = False
         
-        _log("Engine", f"{num_video_layers} video layers + {num_image_layers} image layers créés")
-        _log("Engine", f"⚠ Max 1 vidéo active à la fois (les autres sont stoppées pour économiser la RAM)")
+        _log("Engine", f"1 video player (réutilisé) + {self.NUM_IMAGE_LAYERS} image layers créés")
+        _log("Engine", f"✅ Pas de player.stop() = pas de crash VLC")
         
-        # Timer pour vérifier l'état des players VLC après un play
+        # Timer pour vérifier l'état du player VLC après un play
         self._state_check_timer = QTimer()
         self._state_check_timer.timeout.connect(self._check_states)
-        self._pending_checks = []
+        self._pending_check_times = []
         
     def play_media(self, filepath, in_point=0.0):
         t0 = time.time()
@@ -300,58 +294,44 @@ class PlayerEngine:
             layer.play(filepath)
             layer.widget.raise_()
             self._last_active_layer = layer
+            self._last_active_is_video = False
             self.current_image_idx = (self.current_image_idx + 1) % len(self.image_layers)
         else:
-            # --- LECTURE VIDEO via VLC ---
-            _log("Engine", f"play_media() VIDEO — VidLayer {self.current_video_idx}")
-            
-            # IMPORTANT : stopper TOUTES les autres vidéos pour économiser la RAM.
-            # Sur un Mac Mini 2010, chaque décodeur VLC software consomme ~100-200 MB.
-            # On ne garde qu'une seule vidéo active à la fois.
-            for i, vl in enumerate(self.video_layers):
-                if i != self.current_video_idx and vl.media_path:
-                    _log("Engine", f"  🧹 Arrêt VidLayer-{i} pour libérer la RAM")
-                    vl.stop()
-            
-            layer = self.video_layers[self.current_video_idx]
-            layer.stop()
-            layer.set_geometry(x, y, w, h)
-            layer.play(filepath, in_point)
-            layer.widget.raise_()
-            self._last_active_layer = layer
+            # --- LECTURE VIDEO via VLC (un seul player, réutilisé) ---
+            _log("Engine", f"play_media() VIDEO")
+            self.video_player.set_geometry(x, y, w, h)
+            self.video_player.play(filepath, in_point)
+            self.video_player.widget.raise_()
+            self._last_active_layer = self.video_player
+            self._last_active_is_video = True
             
             # Programmer des vérifications d'état
-            self._pending_checks.append((layer, [200, 500, 1000, 2000, 5000]))
+            self._pending_check_times = [200, 500, 1000, 2000, 5000]
             if not self._state_check_timer.isActive():
                 self._state_check_timer.start(100)
-            
-            self.current_video_idx = (self.current_video_idx + 1) % len(self.video_layers)
         
         dt_total = (time.time() - t0) * 1000
         _log("Engine", f"play_media() terminé en {dt_total:.0f} ms")
 
     def _check_states(self):
-        """Vérifie périodiquement l'état des players VLC en attente."""
+        """Vérifie périodiquement l'état du player VLC."""
+        if not self._pending_check_times:
+            self._state_check_timer.stop()
+            return
+            
+        if self.video_player._play_request_time is None:
+            self._state_check_timer.stop()
+            return
+            
         now = time.time()
-        still_pending = []
+        elapsed_ms = (now - self.video_player._play_request_time) * 1000
         
-        for layer, check_times in self._pending_checks:
-            if not check_times:
-                continue
-            if layer._play_request_time is None:
-                continue
-                
-            elapsed_ms = (now - layer._play_request_time) * 1000
-            if elapsed_ms >= check_times[0]:
-                _log("Engine", f"--- Vérification état (après {check_times[0]} ms) ---")
-                layer.check_playback_state()
-                check_times.pop(0)
-                
-            if check_times:
-                still_pending.append((layer, check_times))
-        
-        self._pending_checks = still_pending
-        if not still_pending:
+        if elapsed_ms >= self._pending_check_times[0]:
+            _log("Engine", f"--- Vérification état (après {self._pending_check_times[0]} ms) ---")
+            self.video_player.check_playback_state()
+            self._pending_check_times.pop(0)
+            
+        if not self._pending_check_times:
             self._state_check_timer.stop()
 
     def get_last_active_layer(self):
