@@ -11,12 +11,13 @@ import random
 
 # Extensions reconnues comme images (affichées via Qt, pas VLC)
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tiff", ".tif", ".webp"}
-# Extensions reconnues comme vidéo/audio (affichées via VLC)
-VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".wmv", ".flv", ".webm", ".m4v",
-                    ".mpg", ".mpeg", ".wav", ".mp3", ".aac", ".flac", ".ogg"}
 
 # Nombre max de frames figées visibles à l'écran (mosaïque)
 MAX_FROZEN_FRAMES = 12
+
+# Intervalle de rafraîchissement du "live view" (ms)
+# ~7 fps — suffisant pour du contenu SD dans une installation
+LIVE_REFRESH_MS = 150
 
 
 def _log(tag, msg):
@@ -73,6 +74,7 @@ class FrozenFrame:
         self.label.setGeometry(geometry)
         self.label.setPixmap(pixmap)
         self.label.show()
+        self.label.raise_()
         
     def hide(self):
         self.label.hide()
@@ -86,193 +88,18 @@ class FrozenFrame:
         return self.label
 
 
-class SingleVideoPlayer:
-    """Un seul player VLC réutilisé pour toutes les vidéos.
+class PlayerEngine:
+    """Moteur de lecture.
     
-    On évite de créer/détruire des players VLC car player.stop() 
-    provoque un crash (SIGTERM) sur les vieux macOS (High Sierra).
-    À la place, on change simplement le media du player existant.
+    Architecture :
+    - VLC tourne HORS ÉCRAN (widget caché à -5000,-5000) pour le décodage vidéo
+    - Un QLabel "live_label" affiche la vidéo via des snapshots périodiques (~7fps)
+    - Les frozen frames sont de simples QLabels
+    - TOUT est rendu via Qt → pas de problème de z-order avec VLC sur macOS
     """
     
-    def __init__(self, vlc_instance, parent_widget):
-        self._widget = QWidget(parent_widget)
-        self._widget.setStyleSheet("background-color: black;")
-        self.player = vlc_instance.media_player_new()
-        
-        if sys.platform == "darwin":
-            self.player.set_nsobject(int(self._widget.winId()))
-        elif sys.platform.startswith("linux"):
-            self.player.set_xwindow(int(self._widget.winId()))
-        elif sys.platform == "win32":
-            self.player.set_hwnd(int(self._widget.winId()))
-            
-        self._widget.hide()
-        self.media_path = None
-        self._play_request_time = None
-        self._parent_widget = parent_widget
-        
-        # Dossier temporaire pour les snapshots VLC
-        self._snap_dir = tempfile.mkdtemp(prefix="tyg_snap_")
-        self._snap_counter = 0
-        
-    def grab_frame(self):
-        """Capture la frame actuelle de la vidéo via VLC snapshot.
-        
-        On ne peut PAS utiliser widget.grab() car VLC rend directement
-        sur la surface native macOS (NSView), pas via le système de peinture Qt.
-        widget.grab() ne donnerait qu'un rectangle noir.
-        """
-        if not self._widget.isVisible():
-            return None
-            
-        state = self.player.get_state()
-        if state not in (vlc.State.Playing, vlc.State.Paused):
-            _log("Video", f"  Snapshot impossible: état={state}")
-            return None
-        
-        # Utiliser VLC pour faire un snapshot dans un fichier temporaire
-        self._snap_counter += 1
-        snap_path = os.path.join(self._snap_dir, f"snap_{self._snap_counter}.png")
-        
-        # video_take_snapshot(num, filepath, width, height)
-        # width=0, height=0 = taille originale de la vidéo
-        t0 = time.time()
-        result = self.player.video_take_snapshot(0, snap_path, 0, 0)
-        
-        if result != 0:
-            _log("Video", f"  Snapshot VLC échoué (code={result})")
-            return None
-        
-        # Attendre un peu que le fichier soit écrit (VLC est asynchrone)
-        # On vérifie jusqu'à 200ms
-        for _ in range(20):
-            if os.path.exists(snap_path) and os.path.getsize(snap_path) > 0:
-                break
-            time.sleep(0.01)
-        
-        if not os.path.exists(snap_path) or os.path.getsize(snap_path) == 0:
-            _log("Video", f"  Snapshot fichier non trouvé après attente")
-            return None
-            
-        pixmap = QPixmap(snap_path)
-        dt = (time.time() - t0) * 1000
-        
-        # Nettoyer le fichier temporaire
-        try:
-            os.remove(snap_path)
-        except OSError:
-            pass
-        
-        if pixmap.isNull():
-            _log("Video", f"  Snapshot chargé mais pixmap null")
-            return None
-            
-        _log("Video", f"  📸 Snapshot capturé: {pixmap.width()}x{pixmap.height()} en {dt:.0f} ms")
-        return pixmap
-        
-    def play(self, filepath, in_point=0.0):
-        tag = "Video"
-        self._play_request_time = time.time()
-        
-        # --- Info fichier ---
-        size_mb, ext = _file_info(filepath)
-        basename = os.path.basename(filepath)
-        old_media = os.path.basename(self.media_path) if self.media_path else "aucun"
-        _log(tag, f"▶ VIDEO demandée: {basename}")
-        _log(tag, f"  (remplace: {old_media})")
-        _log(tag, f"  Chemin complet: {filepath}")
-        if size_mb >= 0:
-            _log(tag, f"  Taille: {size_mb:.1f} MB | Extension: {ext}")
-        else:
-            _log(tag, f"  ⚠ Impossible de lire le fichier: {ext}")
-            
-        # --- Test vitesse lecture disque ---
-        bytes_read, dt, speed_mb = _read_speed_test(filepath)
-        if speed_mb > 0:
-            _log(tag, f"  Vitesse lecture disque: {speed_mb:.1f} MB/s ({bytes_read/1024:.0f} KB en {dt*1000:.0f} ms)")
-        elif speed_mb < 0:
-            _log(tag, f"  ⚠ Erreur lecture disque !")
-        
-        self.media_path = filepath
-        
-        # --- Changement de media SANS stop() ---
-        t0 = time.time()
-        media = self.player.get_instance().media_new(filepath)
-        media.add_option(f"start-time={in_point}")
-        media.add_option(":avcodec-hw=none")
-        media.add_option(":no-videotoolbox")
-        self.player.set_media(media)
-        dt_media = (time.time() - t0) * 1000
-        _log(tag, f"  Media VLC remplacé en {dt_media:.0f} ms (in_point={in_point})")
-        
-        # --- Lancement lecture ---
-        t0 = time.time()
-        self.player.play()
-        dt_play = (time.time() - t0) * 1000
-        _log(tag, f"  player.play() retourné en {dt_play:.0f} ms")
-        
-        self._widget.show()
-        
-    def hide(self):
-        """Cache le widget vidéo sans appeler player.stop()."""
-        self._widget.hide()
-        
-    def set_geometry(self, x, y, w, h):
-        self._widget.setGeometry(QRect(x, y, w, h))
-
-    @property
-    def widget(self):
-        return self._widget
-
-    def check_playback_state(self):
-        """Vérifie l'état du player VLC et logge les infos."""
-        tag = "Video"
-        state = self.player.get_state()
-        state_names = {
-            vlc.State.NothingSpecial: "NothingSpecial",
-            vlc.State.Opening: "Opening",
-            vlc.State.Buffering: "Buffering", 
-            vlc.State.Playing: "Playing",
-            vlc.State.Paused: "Paused",
-            vlc.State.Stopped: "Stopped",
-            vlc.State.Ended: "Ended",
-            vlc.State.Error: "Error",
-        }
-        state_name = state_names.get(state, str(state))
-        
-        elapsed = ""
-        if self._play_request_time:
-            elapsed = f" (depuis play: {(time.time() - self._play_request_time)*1000:.0f} ms)"
-        
-        _log(tag, f"  État VLC: {state_name}{elapsed}")
-        
-        if state == vlc.State.Playing:
-            media = self.player.get_media()
-            if media:
-                duration = self.player.get_length()
-                position = self.player.get_time()
-                _log(tag, f"  Position: {position} ms / {duration} ms")
-                    
-                vw = self.player.video_get_width()
-                vh = self.player.video_get_height()
-                if vw and vh:
-                    _log(tag, f"  Résolution vidéo: {vw}x{vh}")
-                    
-                fps = self.player.get_fps()
-                if fps:
-                    _log(tag, f"  FPS: {fps:.1f}")
-                    
-            return True
-        elif state == vlc.State.Error:
-            _log(tag, f"  ❌ ERREUR VLC lors de la lecture !")
-            return False
-        
-        return None
-
-
-class PlayerEngine:
     def __init__(self, parent_widget):
-        # VLC : désactivation de l'accélération matérielle.
+        # VLC : désactivation de l'accélération matérielle
         vlc_args = [
             "--no-xlib",
             "--avcodec-hw=none",
@@ -282,62 +109,113 @@ class PlayerEngine:
         _log("Engine", f"Initialisation VLC avec args: {vlc_args}")
         self.vlc_instance = vlc.Instance(*vlc_args)
         
-        # UN SEUL player vidéo VLC (réutilisé, jamais stop(), juste set_media)
-        self.video_player = SingleVideoPlayer(self.vlc_instance, parent_widget)
+        # Player VLC HORS ÉCRAN (pour le décodage uniquement)
+        self._vlc_widget = QWidget(parent_widget)
+        self._vlc_widget.setGeometry(-5000, -5000, 720, 576)
+        self._vlc_widget.show()  # Doit être "visible" pour que VLC rende
+        self.player = self.vlc_instance.media_player_new()
         
-        # Pool de frames figées (mosaïque de screenshots)
+        if sys.platform == "darwin":
+            self.player.set_nsobject(int(self._vlc_widget.winId()))
+        elif sys.platform.startswith("linux"):
+            self.player.set_xwindow(int(self._vlc_widget.winId()))
+        elif sys.platform == "win32":
+            self.player.set_hwnd(int(self._vlc_widget.winId()))
+        
+        self.media_path = None
+        self._play_request_time = None
+        
+        # QLabel "live" : affiche la vidéo en cours via snapshots Qt
+        self.live_label = QLabel(parent_widget)
+        self.live_label.setStyleSheet("background-color: black;")
+        self.live_label.setScaledContents(True)
+        self.live_label.hide()
+        
+        # Pool de frames figées (mosaïque)
         self.frozen_frames = [FrozenFrame(parent_widget, i) for i in range(MAX_FROZEN_FRAMES)]
         self.current_frozen_idx = 0
         
         self.parent_widget = parent_widget
-        
-        # Référence au dernier layer utilisé (pour les CC MIDI scale/pos)
         self._last_active_layer = None
-        self._last_active_is_video = False
         
-        _log("Engine", f"1 video player + {MAX_FROZEN_FRAMES} frozen frames créés")
-        _log("Engine", f"✅ Mosaïque: chaque nouveau clip fige l'ancien en image statique")
+        # Dossier temporaire pour les snapshots VLC
+        self._snap_dir = tempfile.mkdtemp(prefix="tyg_snap_")
+        self._snap_counter = 0
         
-        # Timer pour vérifier l'état du player VLC après un play
+        # Timer pour rafraîchir le "live view" avec des snapshots VLC
+        self._live_timer = QTimer()
+        self._live_timer.timeout.connect(self._refresh_live)
+        self._is_video_playing = False
+        
+        # Timer pour vérifier l'état VLC
         self._state_check_timer = QTimer()
         self._state_check_timer.timeout.connect(self._check_states)
         self._pending_check_times = []
         
-    def _freeze_current_video(self):
-        """Capture la frame actuelle de la vidéo et la fige comme image statique."""
-        if not self.video_player.widget.isVisible():
-            return
-            
-        pixmap = self.video_player.grab_frame()
-        if pixmap is None or pixmap.isNull():
-            _log("Engine", "  ❄ Pas de frame à figer (widget vide)")
-            return
-            
-        # Récupérer la géométrie actuelle du player vidéo
-        geometry = self.video_player.widget.geometry()
+        _log("Engine", f"VLC hors écran + {MAX_FROZEN_FRAMES} frozen frames")
+        _log("Engine", f"✅ Tout rendu via Qt (pas de surface VLC visible)")
+        _log("Engine", f"   Live refresh: {LIVE_REFRESH_MS}ms (~{1000//LIVE_REFRESH_MS} fps)")
         
-        # Placer la frame figée dans le pool (round-robin)
+    def _take_snapshot(self):
+        """Capture une frame VLC et la retourne comme QPixmap."""
+        state = self.player.get_state()
+        if state not in (vlc.State.Playing, vlc.State.Paused):
+            return None
+        
+        self._snap_counter += 1
+        snap_path = os.path.join(self._snap_dir, f"snap_{self._snap_counter}.png")
+        
+        result = self.player.video_take_snapshot(0, snap_path, 0, 0)
+        if result != 0:
+            return None
+        
+        # Attendre que le fichier soit écrit
+        for _ in range(15):
+            if os.path.exists(snap_path) and os.path.getsize(snap_path) > 0:
+                break
+            time.sleep(0.01)
+        
+        if not os.path.exists(snap_path) or os.path.getsize(snap_path) == 0:
+            return None
+            
+        pixmap = QPixmap(snap_path)
+        
+        try:
+            os.remove(snap_path)
+        except OSError:
+            pass
+        
+        if pixmap.isNull():
+            return None
+            
+        return pixmap
+    
+    def _refresh_live(self):
+        """Rafraîchit le QLabel live avec un snapshot VLC."""
+        if not self._is_video_playing:
+            return
+            
+        pixmap = self._take_snapshot()
+        if pixmap is not None:
+            self.live_label.setPixmap(pixmap)
+            if not self.live_label.isVisible():
+                self.live_label.show()
+            self.live_label.raise_()
+    
+    def _freeze_live(self):
+        """Fige le contenu actuel du live_label comme frozen frame."""
+        if not self.live_label.isVisible():
+            return
+            
+        pixmap = self.live_label.pixmap()
+        if pixmap is None or pixmap.isNull():
+            return
+            
+        geometry = self.live_label.geometry()
         frozen = self.frozen_frames[self.current_frozen_idx]
         frozen.show_pixmap(pixmap, geometry)
         
         _log("Engine", f"  ❄ Frame figée → FrozenFrame-{self.current_frozen_idx} ({geometry.width()}x{geometry.height()})")
-        
-        self.current_frozen_idx = (self.current_frozen_idx + 1) % len(self.frozen_frames)
-        
-    def _freeze_current_image(self, image_layer):
-        """Fige l'image actuelle en tant que frozen frame pour libérer l'ImageLayer."""
-        if not image_layer.widget.isVisible() or not image_layer.media_path:
-            return
-            
-        pixmap = image_layer.label.pixmap()
-        if pixmap is None or pixmap.isNull():
-            return
-            
-        geometry = image_layer.widget.geometry()
-        frozen = self.frozen_frames[self.current_frozen_idx]
-        frozen.show_pixmap(pixmap, geometry)
-        
-        _log("Engine", f"  ❄ Image figée → FrozenFrame-{self.current_frozen_idx}")
         self.current_frozen_idx = (self.current_frozen_idx + 1) % len(self.frozen_frames)
         
     def play_media(self, filepath, in_point=0.0):
@@ -355,13 +233,12 @@ class PlayerEngine:
         y = random.randint(0, ph - h)
         
         if _is_image(filepath):
-            # --- AFFICHAGE IMAGE via Qt ---
+            # --- AFFICHAGE IMAGE ---
             _log("Engine", f"play_media() IMAGE")
             
-            # Figer la vidéo en cours si visible
-            self._freeze_current_video()
+            # Figer le live actuel s'il est visible
+            self._freeze_live()
             
-            # Créer un frozen frame directement pour l'image
             basename = os.path.basename(filepath)
             _log("Engine", f"  🖼 Chargement: {basename}")
             
@@ -375,37 +252,63 @@ class PlayerEngine:
                 orig_w, orig_h = pixmap.width(), pixmap.height()
                 _log("Engine", f"  Chargée en {dt_load:.0f} ms — {orig_w}x{orig_h}")
                 
-                # Réduire pour économiser la RAM
                 if orig_w > 1920 or orig_h > 1080:
                     pixmap = pixmap.scaled(1920, 1080, Qt.KeepAspectRatio, Qt.SmoothTransformation)
                     _log("Engine", f"  ↓ Réduite à {pixmap.width()}x{pixmap.height()}")
                 
-                # Placer dans le pool de frozen frames
                 frozen = self.frozen_frames[self.current_frozen_idx]
                 frozen.show_pixmap(pixmap, QRect(x, y, w, h))
-                frozen.label.raise_()
                 self._last_active_layer = frozen
-                self._last_active_is_video = False
                 
                 _log("Engine", f"  → FrozenFrame-{self.current_frozen_idx}")
                 self.current_frozen_idx = (self.current_frozen_idx + 1) % len(self.frozen_frames)
             
         else:
-            # --- LECTURE VIDEO via VLC ---
+            # --- LECTURE VIDEO ---
             _log("Engine", f"play_media() VIDEO")
             
-            # 1. Figer la frame actuelle de la vidéo en cours
-            self._freeze_current_video()
+            # 1. Figer le live actuel
+            self._freeze_live()
             
-            # 2. Déplacer le player VLC à la nouvelle position et jouer le nouveau clip
-            self.video_player.set_geometry(x, y, w, h)
-            self.video_player.play(filepath, in_point)
-            self.video_player.widget.raise_()
-            self._last_active_layer = self.video_player
-            self._last_active_is_video = True
+            # 2. Info fichier
+            size_mb, ext = _file_info(filepath)
+            basename = os.path.basename(filepath)
+            old_media = os.path.basename(self.media_path) if self.media_path else "aucun"
+            _log("Engine", f"  ▶ {basename}")
+            _log("Engine", f"    (remplace: {old_media})")
+            if size_mb >= 0:
+                _log("Engine", f"    Taille: {size_mb:.1f} MB | Extension: {ext}")
+            
+            # Test vitesse disque
+            bytes_read, dt, speed_mb = _read_speed_test(filepath)
+            if speed_mb > 0:
+                _log("Engine", f"    Disque: {speed_mb:.1f} MB/s")
+            
+            self.media_path = filepath
+            
+            # 3. Changer le media VLC (pas de stop!)
+            media = self.player.get_instance().media_new(filepath)
+            media.add_option(f"start-time={in_point}")
+            media.add_option(":avcodec-hw=none")
+            media.add_option(":no-videotoolbox")
+            self.player.set_media(media)
+            self.player.play()
+            self._play_request_time = time.time()
+            self._is_video_playing = True
+            
+            # 4. Positionner le live_label à l'endroit voulu
+            self.live_label.setGeometry(QRect(x, y, w, h))
+            self.live_label.setStyleSheet("background-color: black;")
+            self.live_label.show()
+            self.live_label.raise_()
+            self._last_active_layer = self
+            
+            # 5. Démarrer le timer de rafraîchissement live
+            if not self._live_timer.isActive():
+                self._live_timer.start(LIVE_REFRESH_MS)
             
             # Programmer des vérifications d'état
-            self._pending_check_times = [200, 500, 1000, 2000, 5000]
+            self._pending_check_times = [500, 1000, 3000]
             if not self._state_check_timer.isActive():
                 self._state_check_timer.start(100)
         
@@ -418,20 +321,51 @@ class PlayerEngine:
             self._state_check_timer.stop()
             return
             
-        if self.video_player._play_request_time is None:
+        if self._play_request_time is None:
             self._state_check_timer.stop()
             return
             
         now = time.time()
-        elapsed_ms = (now - self.video_player._play_request_time) * 1000
+        elapsed_ms = (now - self._play_request_time) * 1000
         
         if elapsed_ms >= self._pending_check_times[0]:
-            _log("Engine", f"--- Vérification état (après {self._pending_check_times[0]} ms) ---")
-            self.video_player.check_playback_state()
+            tag = "Engine"
+            state = self.player.get_state()
+            state_names = {
+                vlc.State.NothingSpecial: "NothingSpecial",
+                vlc.State.Opening: "Opening",
+                vlc.State.Buffering: "Buffering", 
+                vlc.State.Playing: "Playing",
+                vlc.State.Paused: "Paused",
+                vlc.State.Stopped: "Stopped",
+                vlc.State.Ended: "Ended",
+                vlc.State.Error: "Error",
+            }
+            state_name = state_names.get(state, str(state))
+            _log(tag, f"--- État VLC: {state_name} (après {self._pending_check_times[0]} ms) ---")
+            
+            if state == vlc.State.Playing:
+                vw = self.player.video_get_width()
+                vh = self.player.video_get_height()
+                fps = self.player.get_fps()
+                if vw and vh:
+                    _log(tag, f"    {vw}x{vh} @ {fps:.0f}fps")
+            
             self._pending_check_times.pop(0)
             
         if not self._pending_check_times:
             self._state_check_timer.stop()
+
+    # --- Interface pour les CC MIDI (scale/position) ---
+    
+    @property
+    def widget(self):
+        """Pour la compatibilité avec le CC handler d'install_mode."""
+        return self.live_label
+    
+    def set_geometry(self, x, y, w, h):
+        """Pour la compatibilité avec le CC handler d'install_mode."""
+        self.live_label.setGeometry(QRect(x, y, w, h))
 
     def get_last_active_layer(self):
         return self._last_active_layer
