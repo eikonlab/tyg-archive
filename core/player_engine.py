@@ -1,10 +1,11 @@
 import sys
 import os
 import time
+import tempfile
 import vlc
 from PyQt5.QtWidgets import QWidget, QLabel
 from PyQt5.QtCore import QRect, QTimer, Qt
-from PyQt5.QtGui import QPixmap, QScreen
+from PyQt5.QtGui import QPixmap
 import random
 
 
@@ -15,7 +16,7 @@ VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".wmv", ".flv", ".webm", ".m
                     ".mpg", ".mpeg", ".wav", ".mp3", ".aac", ".flac", ".ogg"}
 
 # Nombre max de frames figées visibles à l'écran (mosaïque)
-MAX_FROZEN_FRAMES = 20
+MAX_FROZEN_FRAMES = 12
 
 
 def _log(tag, msg):
@@ -110,14 +111,63 @@ class SingleVideoPlayer:
         self._play_request_time = None
         self._parent_widget = parent_widget
         
+        # Dossier temporaire pour les snapshots VLC
+        self._snap_dir = tempfile.mkdtemp(prefix="tyg_snap_")
+        self._snap_counter = 0
+        
     def grab_frame(self):
-        """Capture la frame actuelle du widget VLC comme QPixmap."""
+        """Capture la frame actuelle de la vidéo via VLC snapshot.
+        
+        On ne peut PAS utiliser widget.grab() car VLC rend directement
+        sur la surface native macOS (NSView), pas via le système de peinture Qt.
+        widget.grab() ne donnerait qu'un rectangle noir.
+        """
         if not self._widget.isVisible():
             return None
-        # grab() capture le contenu rendu du widget
-        pixmap = self._widget.grab()
-        if pixmap.isNull():
+            
+        state = self.player.get_state()
+        if state not in (vlc.State.Playing, vlc.State.Paused):
+            _log("Video", f"  Snapshot impossible: état={state}")
             return None
+        
+        # Utiliser VLC pour faire un snapshot dans un fichier temporaire
+        self._snap_counter += 1
+        snap_path = os.path.join(self._snap_dir, f"snap_{self._snap_counter}.png")
+        
+        # video_take_snapshot(num, filepath, width, height)
+        # width=0, height=0 = taille originale de la vidéo
+        t0 = time.time()
+        result = self.player.video_take_snapshot(0, snap_path, 0, 0)
+        
+        if result != 0:
+            _log("Video", f"  Snapshot VLC échoué (code={result})")
+            return None
+        
+        # Attendre un peu que le fichier soit écrit (VLC est asynchrone)
+        # On vérifie jusqu'à 200ms
+        for _ in range(20):
+            if os.path.exists(snap_path) and os.path.getsize(snap_path) > 0:
+                break
+            time.sleep(0.01)
+        
+        if not os.path.exists(snap_path) or os.path.getsize(snap_path) == 0:
+            _log("Video", f"  Snapshot fichier non trouvé après attente")
+            return None
+            
+        pixmap = QPixmap(snap_path)
+        dt = (time.time() - t0) * 1000
+        
+        # Nettoyer le fichier temporaire
+        try:
+            os.remove(snap_path)
+        except OSError:
+            pass
+        
+        if pixmap.isNull():
+            _log("Video", f"  Snapshot chargé mais pixmap null")
+            return None
+            
+        _log("Video", f"  📸 Snapshot capturé: {pixmap.width()}x{pixmap.height()} en {dt:.0f} ms")
         return pixmap
         
     def play(self, filepath, in_point=0.0):
