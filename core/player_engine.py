@@ -68,7 +68,7 @@ class ImageLayer:
         self._play_request_time = None
         self._is_image_layer = True
         
-    def play(self, filepath):
+    def play(self, filepath, max_w=1920, max_h=1080):
         tag = f"ImgLayer-{self.layer_id}"
         self._play_request_time = time.time()
         self.media_path = filepath
@@ -83,8 +83,18 @@ class ImageLayer:
         if pixmap.isNull():
             _log(tag, f"  ⚠ Impossible de charger l'image !")
             return
-            
-        _log(tag, f"  Chargée en {dt_load:.0f} ms — {pixmap.width()}x{pixmap.height()}")
+        
+        orig_w, orig_h = pixmap.width(), pixmap.height()
+        _log(tag, f"  Chargée en {dt_load:.0f} ms — {orig_w}x{orig_h}")
+        
+        # Réduire l'image à la taille d'affichage pour économiser la RAM
+        # (une image 3849x5731 = ~88 MB en RAM, réduite à 1920x1080 = ~8 MB)
+        if orig_w > max_w or orig_h > max_h:
+            t0 = time.time()
+            pixmap = pixmap.scaled(max_w, max_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            dt_scale = (time.time() - t0) * 1000
+            _log(tag, f"  ↓ Réduite à {pixmap.width()}x{pixmap.height()} en {dt_scale:.0f} ms (économie RAM)")
+        
         self.label.setPixmap(pixmap)
         self.label.show()
     
@@ -229,9 +239,16 @@ class VideoLayer:
 
 
 class PlayerEngine:
-    def __init__(self, parent_widget, num_layers=3):
+    # Max 2 vidéos VLC simultanées pour limiter la RAM sur les vieux Mac
+    MAX_VIDEO_LAYERS = 2
+    # 3 layers images (légers grâce au downscale)
+    MAX_IMAGE_LAYERS = 3
+    
+    def __init__(self, parent_widget, num_video_layers=None, num_image_layers=None):
+        num_video_layers = num_video_layers or self.MAX_VIDEO_LAYERS
+        num_image_layers = num_image_layers or self.MAX_IMAGE_LAYERS
+        
         # VLC : désactivation de l'accélération matérielle.
-        # On ne force plus --codec=avcodec,none car les images sont gérées par Qt.
         vlc_args = [
             "--no-xlib",
             "--avcodec-hw=none",        # Désactive le décodage HW générique
@@ -242,8 +259,8 @@ class PlayerEngine:
         self.vlc_instance = vlc.Instance(*vlc_args)
         
         # Layers vidéo (VLC) et image (Qt) séparés
-        self.video_layers = [VideoLayer(self.vlc_instance, parent_widget, i) for i in range(num_layers)]
-        self.image_layers = [ImageLayer(parent_widget, i) for i in range(num_layers)]
+        self.video_layers = [VideoLayer(self.vlc_instance, parent_widget, i) for i in range(num_video_layers)]
+        self.image_layers = [ImageLayer(parent_widget, i) for i in range(num_image_layers)]
         
         self.current_video_idx = 0
         self.current_image_idx = 0
@@ -252,7 +269,8 @@ class PlayerEngine:
         # Référence au dernier layer utilisé (pour les CC MIDI scale/pos)
         self._last_active_layer = None
         
-        _log("Engine", f"{num_layers} video layers + {num_layers} image layers créés")
+        _log("Engine", f"{num_video_layers} video layers + {num_image_layers} image layers créés")
+        _log("Engine", f"⚠ Max 1 vidéo active à la fois (les autres sont stoppées pour économiser la RAM)")
         
         # Timer pour vérifier l'état des players VLC après un play
         self._state_check_timer = QTimer()
@@ -286,6 +304,15 @@ class PlayerEngine:
         else:
             # --- LECTURE VIDEO via VLC ---
             _log("Engine", f"play_media() VIDEO — VidLayer {self.current_video_idx}")
+            
+            # IMPORTANT : stopper TOUTES les autres vidéos pour économiser la RAM.
+            # Sur un Mac Mini 2010, chaque décodeur VLC software consomme ~100-200 MB.
+            # On ne garde qu'une seule vidéo active à la fois.
+            for i, vl in enumerate(self.video_layers):
+                if i != self.current_video_idx and vl.media_path:
+                    _log("Engine", f"  🧹 Arrêt VidLayer-{i} pour libérer la RAM")
+                    vl.stop()
+            
             layer = self.video_layers[self.current_video_idx]
             layer.stop()
             layer.set_geometry(x, y, w, h)
