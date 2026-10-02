@@ -63,28 +63,55 @@ class SettingsWindow(QWidget):
             return
             
         self.learning_cc = param_name
+        self.learned_cc_values = {}  # Store initial values to detect actual movement
+        
         if self.midi_thread:
             self.midi_thread.stop()
             
         self.midi_thread = MidiListener(port)
         self.midi_thread.cc_signal.connect(self.on_cc_learned)
         self.midi_thread.start()
-        QMessageBox.information(self, "Apprentissage", "Tournez le potentiomètre sur votre clavier MIDI, puis fermez ce message.")
         
-    def on_cc_learned(self, control, value):
-        if self.learning_cc:
-            self.config[self.learning_cc] = control
-            if self.learning_cc == "cc_scale":
-                self.lbl_cc_scale.setText(f"CC Scale: {control}")
-            elif self.learning_cc == "cc_pos_x":
-                self.lbl_cc_x.setText(f"CC Pos X: {control}")
-            elif self.learning_cc == "cc_pos_y":
-                self.lbl_cc_y.setText(f"CC Pos Y: {control}")
+        self.learn_msgbox = QMessageBox(self)
+        self.learn_msgbox.setWindowTitle("Apprentissage")
+        self.learn_msgbox.setText("Tournez le potentiomètre sur votre clavier MIDI...")
+        self.learn_msgbox.setStandardButtons(QMessageBox.Cancel)
+        self.learn_msgbox.buttonClicked.connect(self.cancel_learn)
+        self.learn_msgbox.show()
+        
+    def cancel_learn(self):
+        self.learning_cc = None
+        if self.midi_thread:
+            self.midi_thread.stop()
+            self.midi_thread = None
             
-            self.learning_cc = None
-            if self.midi_thread:
-                self.midi_thread.stop()
-                self.midi_thread = None
+    def on_cc_learned(self, control, value):
+        if not self.learning_cc:
+            return
+            
+        # Ignore CC if its value hasn't changed significantly (filters out static noise)
+        if control not in self.learned_cc_values:
+            self.learned_cc_values[control] = value
+            return
+            
+        if abs(self.learned_cc_values[control] - value) < 3:
+            return
+            
+        self.config[self.learning_cc] = control
+        if self.learning_cc == "cc_scale":
+            self.lbl_cc_scale.setText(f"CC Scale: {control}")
+        elif self.learning_cc == "cc_pos_x":
+            self.lbl_cc_x.setText(f"CC Pos X: {control}")
+        elif self.learning_cc == "cc_pos_y":
+            self.lbl_cc_y.setText(f"CC Pos Y: {control}")
+        
+        self.learning_cc = None
+        if self.midi_thread:
+            self.midi_thread.stop()
+            self.midi_thread = None
+            
+        if hasattr(self, 'learn_msgbox') and self.learn_msgbox:
+            self.learn_msgbox.accept()
 
     def save_settings(self):
         self.config["midi_input"] = self.midi_combo.currentText()
