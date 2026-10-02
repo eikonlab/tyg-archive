@@ -200,7 +200,6 @@ class PlayerEngine:
             self.live_label.setPixmap(pixmap)
             if not self.live_label.isVisible():
                 self.live_label.show()
-            self.live_label.raise_()
     
     def _freeze_live(self):
         """Fige le contenu actuel du live_label comme frozen frame."""
@@ -238,6 +237,12 @@ class PlayerEngine:
             
             # Figer le live actuel s'il est visible
             self._freeze_live()
+            
+            # Stop any running video so it doesn't keep refreshing and popping to the front
+            self._is_video_playing = False
+            if self.player.get_state() != vlc.State.Stopped:
+                self.player.stop()
+            self.live_label.hide()
             
             basename = os.path.basename(filepath)
             _log("Engine", f"  🖼 Chargement: {basename}")
