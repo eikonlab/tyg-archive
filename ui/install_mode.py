@@ -165,6 +165,8 @@ class InstallMode(QWidget):
     def close_and_stop(self):
         if self.midi_thread:
             self.midi_thread.stop()
+        if hasattr(self, 'engine'):
+            self.engine.cleanup()
         self.close()
         
     def keyPressEvent(self, event):

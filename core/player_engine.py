@@ -396,3 +396,14 @@ class PlayerEngine:
 
     def get_last_active_layer(self):
         return self._last_active_layer
+
+    def cleanup(self):
+        self._is_video_playing = False
+        if self._live_timer.isActive():
+            self._live_timer.stop()
+        if self._state_check_timer.isActive():
+            self._state_check_timer.stop()
+        if hasattr(self, 'player') and self.player:
+            self.player.stop()
+            self.player.release()
+            self.player = None

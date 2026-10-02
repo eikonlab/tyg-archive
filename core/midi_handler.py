@@ -20,13 +20,16 @@ class MidiListener(QThread):
             with mido.open_input(self.port_name) as port:
                 self.log_signal.emit(f"Connecté avec succès au port MIDI: {self.port_name}")
                 while self.running:
-                    msg = port.receive()
-                    if msg.type == 'note_on' and msg.velocity > 0:
-                        self.log_signal.emit(f"MIDI In -> Note On: {msg.note}, Vel: {msg.velocity}")
-                        self.note_on_signal.emit(msg.note, msg.velocity)
-                    elif msg.type == 'control_change':
-                        self.log_signal.emit(f"MIDI In -> CC: {msg.control} (Ch {msg.channel}), Val: {msg.value}")
-                        self.cc_signal.emit(msg.channel, msg.control, msg.value)
+                    msg = port.poll()
+                    if msg:
+                        if msg.type == 'note_on' and msg.velocity > 0:
+                            self.log_signal.emit(f"MIDI In -> Note On: {msg.note}, Vel: {msg.velocity}")
+                            self.note_on_signal.emit(msg.note, msg.velocity)
+                        elif msg.type == 'control_change':
+                            self.log_signal.emit(f"MIDI In -> CC: {msg.control} (Ch {msg.channel}), Val: {msg.value}")
+                            self.cc_signal.emit(msg.channel, msg.control, msg.value)
+                    else:
+                        self.msleep(10)
         except Exception as e:
             self.log_signal.emit(f"Erreur MIDI: {e}")
             print(f"Erreur MIDI: {e}")
