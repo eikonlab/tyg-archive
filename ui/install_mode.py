@@ -86,12 +86,19 @@ class InstallMode(QWidget):
         scrollbar.setValue(scrollbar.maximum())
             
     def on_midi_note(self, note, velocity):
+        import time
+        now = time.time()
+        if now - getattr(self, 'last_note_time', 0) < 0.2:
+            self.log_debug(f"Action ignorée: anti-surcharge (note {note})")
+            return
+        
         year = self.year_combo.currentText()
         if not year: return
         
         media_list = self.config["years"].get(year, [])
         for media in media_list:
             if media.get("midi_note") == note:
+                self.last_note_time = now
                 self.log_debug(f"Action: Lecture de {media['filepath']} (In: {media.get('in_point', 0.0)})")
                 self.engine.play_media(media["filepath"], media.get("in_point", 0.0))
                 break
