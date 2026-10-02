@@ -1,4 +1,4 @@
-from PyQt5.QtWidgets import QWidget, QVBoxLayout, QComboBox, QHBoxLayout, QTextEdit
+from PyQt5.QtWidgets import QWidget, QVBoxLayout, QComboBox, QHBoxLayout, QTextEdit, QPushButton
 from PyQt5.QtCore import Qt
 from core.player_engine import PlayerEngine
 from core.config import load_config
@@ -12,7 +12,7 @@ class InstallMode(QWidget):
         self.setStyleSheet("background-color: black; color: white;")
         
         self.config = load_config()
-        self.years = list(self.config.get("years", {}).keys())
+        self.years = sorted(list(self.config.get("years", {}).keys()))
         
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
@@ -35,6 +35,23 @@ class InstallMode(QWidget):
         """)
         top_bar.addWidget(self.year_combo)
         top_bar.addStretch()
+        
+        self.quit_btn = QPushButton("Quitter")
+        self.quit_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #aa0000;
+                color: white;
+                font-size: 16px;
+                padding: 8px 15px;
+                border: none;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #ff0000;
+            }
+        """)
+        self.quit_btn.clicked.connect(self.close_and_stop)
+        top_bar.addWidget(self.quit_btn)
         
         layout.addLayout(top_bar)
         
@@ -113,8 +130,9 @@ class InstallMode(QWidget):
             scale = 0.1 + (value / 127.0) * 1.5
             cx = rect.x() + rect.width() / 2
             cy = rect.y() + rect.height() / 2
+            aspect = rect.width() / float(rect.height()) if rect.height() > 0 else 1.0
             w = int(parent_rect.width() * scale)
-            h = int(parent_rect.height() * scale)
+            h = int(w / aspect)
             layer.set_geometry(int(cx - w/2), int(cy - h/2), w, h)
             
         elif is_pos_x:
@@ -125,8 +143,11 @@ class InstallMode(QWidget):
             y = int((value / 127.0) * (parent_rect.height() - rect.height()))
             layer.set_geometry(rect.x(), y, rect.width(), rect.height())
             
+    def close_and_stop(self):
+        if self.midi_thread:
+            self.midi_thread.stop()
+        self.close()
+        
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Escape:
-            if self.midi_thread:
-                self.midi_thread.stop()
-            self.close()
+            self.close_and_stop()

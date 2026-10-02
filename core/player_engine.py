@@ -260,6 +260,15 @@ class PlayerEngine:
                 if orig_w > 1920 or orig_h > 1080:
                     pixmap = pixmap.scaled(1920, 1080, Qt.KeepAspectRatio, Qt.SmoothTransformation)
                     _log("Engine", f"  ↓ Réduite à {pixmap.width()}x{pixmap.height()}")
+                    
+                if orig_h > 0:
+                    aspect = orig_w / orig_h
+                    h = int(w / aspect)
+                    if h > ph:
+                        h = ph
+                        w = int(h * aspect)
+                    if x + w > pw: x = pw - w
+                    if y + h > ph: y = ph - h
                 
                 frozen = self.frozen_frames[self.current_frozen_idx]
                 frozen.show_pixmap(pixmap, QRect(x, y, w, h))
@@ -300,6 +309,7 @@ class PlayerEngine:
             self.player.play()
             self._play_request_time = time.time()
             self._is_video_playing = True
+            self._video_aspect_adjusted = False
             
             # 4. Positionner le live_label à l'endroit voulu
             self.live_label.setGeometry(QRect(x, y, w, h))
@@ -355,6 +365,15 @@ class PlayerEngine:
                 fps = self.player.get_fps()
                 if vw and vh:
                     _log(tag, f"    {vw}x{vh} @ {fps:.0f}fps")
+                    if not getattr(self, '_video_aspect_adjusted', False):
+                        self._video_aspect_adjusted = True
+                        aspect = vw / vh
+                        rect = self.live_label.geometry()
+                        cx = rect.x() + rect.width() / 2
+                        cy = rect.y() + rect.height() / 2
+                        new_w = rect.width()
+                        new_h = int(new_w / aspect)
+                        self.live_label.setGeometry(QRect(int(cx - new_w/2), int(cy - new_h/2), new_w, new_h))
             
             self._pending_check_times.pop(0)
             
