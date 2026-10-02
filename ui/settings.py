@@ -85,25 +85,28 @@ class SettingsWindow(QWidget):
             self.midi_thread.stop()
             self.midi_thread = None
             
-    def on_cc_learned(self, control, value):
+    def on_cc_learned(self, channel, control, value):
         if not self.learning_cc:
             return
             
+        # Create a unique signature combining channel and control
+        sig = f"{channel}:{control}"
+            
         # Ignore CC if its value hasn't changed significantly (filters out static noise)
-        if control not in self.learned_cc_values:
-            self.learned_cc_values[control] = value
+        if sig not in self.learned_cc_values:
+            self.learned_cc_values[sig] = value
             return
             
-        if abs(self.learned_cc_values[control] - value) < 3:
+        if abs(self.learned_cc_values[sig] - value) < 3:
             return
             
-        self.config[self.learning_cc] = control
+        self.config[self.learning_cc] = sig
         if self.learning_cc == "cc_scale":
-            self.lbl_cc_scale.setText(f"CC Scale: {control}")
+            self.lbl_cc_scale.setText(f"CC Scale: {sig}")
         elif self.learning_cc == "cc_pos_x":
-            self.lbl_cc_x.setText(f"CC Pos X: {control}")
+            self.lbl_cc_x.setText(f"CC Pos X: {sig}")
         elif self.learning_cc == "cc_pos_y":
-            self.lbl_cc_y.setText(f"CC Pos Y: {control}")
+            self.lbl_cc_y.setText(f"CC Pos Y: {sig}")
         
         self.learning_cc = None
         if self.midi_thread:

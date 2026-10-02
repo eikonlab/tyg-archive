@@ -79,10 +79,28 @@ class InstallMode(QWidget):
                 self.engine.play_media(media["filepath"], media.get("in_point", 0.0))
                 break
                 
-    def on_midi_cc(self, control, value):
+    def on_midi_cc(self, channel, control, value):
         cc_scale = self.config.get("cc_scale") or 74
         cc_pos_x = self.config.get("cc_pos_x") or 71
         cc_pos_y = self.config.get("cc_pos_y") or 72
+        
+        sig = f"{channel}:{control}"
+        
+        # Retro-compatibilité : si la config a stocké un entier (ancienne version)
+        if isinstance(cc_scale, int):
+            is_scale = (control == cc_scale)
+        else:
+            is_scale = (sig == cc_scale)
+            
+        if isinstance(cc_pos_x, int):
+            is_pos_x = (control == cc_pos_x)
+        else:
+            is_pos_x = (sig == cc_pos_x)
+            
+        if isinstance(cc_pos_y, int):
+            is_pos_y = (control == cc_pos_y)
+        else:
+            is_pos_y = (sig == cc_pos_y)
         
         layer = self.engine.get_last_active_layer()
         if not layer or not layer.widget.isVisible():
@@ -91,7 +109,7 @@ class InstallMode(QWidget):
         rect = layer.widget.geometry()
         parent_rect = self.canvas.rect()
         
-        if control == cc_scale:
+        if is_scale:
             scale = 0.1 + (value / 127.0) * 1.5
             cx = rect.x() + rect.width() / 2
             cy = rect.y() + rect.height() / 2
@@ -99,11 +117,11 @@ class InstallMode(QWidget):
             h = int(parent_rect.height() * scale)
             layer.set_geometry(int(cx - w/2), int(cy - h/2), w, h)
             
-        elif control == cc_pos_x:
+        elif is_pos_x:
             x = int((value / 127.0) * (parent_rect.width() - rect.width()))
             layer.set_geometry(x, rect.y(), rect.width(), rect.height())
             
-        elif control == cc_pos_y:
+        elif is_pos_y:
             y = int((value / 127.0) * (parent_rect.height() - rect.height()))
             layer.set_geometry(rect.x(), y, rect.width(), rect.height())
             
