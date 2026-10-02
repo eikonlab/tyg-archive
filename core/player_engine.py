@@ -300,7 +300,10 @@ class PlayerEngine:
             
             self.media_path = filepath
             
-            # 3. Changer le media VLC (pas de stop!)
+            # 3. Changer le media VLC en s'assurant d'arrêter le précédent pour libérer la mémoire (buffers H264)
+            if self.player.get_state() != vlc.State.Stopped:
+                self.player.stop()
+                
             media = self.player.get_instance().media_new(filepath)
             media.add_option(f"start-time={in_point}")
             media.add_option(":avcodec-hw=none")

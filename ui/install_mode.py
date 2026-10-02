@@ -88,7 +88,7 @@ class InstallMode(QWidget):
     def on_midi_note(self, note, velocity):
         import time
         now = time.time()
-        if now - getattr(self, 'last_note_time', 0) < 0.2:
+        if now - getattr(self, 'last_note_time', 0) < 0.3:
             self.log_debug(f"Action ignorée: anti-surcharge (note {note})")
             return
         
@@ -107,6 +107,7 @@ class InstallMode(QWidget):
         cc_scale = self.config.get("cc_scale") or 74
         cc_pos_x = self.config.get("cc_pos_x") or 71
         cc_pos_y = self.config.get("cc_pos_y") or 72
+        cc_folder = self.config.get("cc_folder")
         
         sig = f"{channel}:{control}"
         
@@ -125,6 +126,17 @@ class InstallMode(QWidget):
             is_pos_y = (control == cc_pos_y)
         else:
             is_pos_y = (sig == cc_pos_y)
+            
+        if isinstance(cc_folder, int):
+            is_folder = (control == cc_folder)
+        else:
+            is_folder = (sig == cc_folder)
+            
+        if is_folder and len(self.years) > 0:
+            # Map 0-127 to 0-(len-1)
+            index = int((value / 127.0) * (len(self.years) - 1))
+            self.year_combo.setCurrentIndex(index)
+            return
         
         layer = self.engine.get_last_active_layer()
         if not layer or not layer.widget.isVisible():

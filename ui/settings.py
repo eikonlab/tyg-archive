@@ -36,7 +36,11 @@ class SettingsWindow(QWidget):
         btn_y = QPushButton("Learn Pos Y")
         btn_y.clicked.connect(lambda: self.start_learn("cc_pos_y"))
         
-        for lbl, btn in [(self.lbl_cc_scale, btn_scale), (self.lbl_cc_x, btn_x), (self.lbl_cc_y, btn_y)]:
+        self.lbl_cc_folder = QLabel(f"CC Folder: {self.config.get('cc_folder', 'Non défini')}")
+        btn_folder = QPushButton("Learn Folder")
+        btn_folder.clicked.connect(lambda: self.start_learn("cc_folder"))
+        
+        for lbl, btn in [(self.lbl_cc_folder, btn_folder), (self.lbl_cc_scale, btn_scale), (self.lbl_cc_x, btn_x), (self.lbl_cc_y, btn_y)]:
             h = QHBoxLayout()
             h.addWidget(lbl)
             h.addWidget(btn)
@@ -107,6 +111,8 @@ class SettingsWindow(QWidget):
             self.lbl_cc_x.setText(f"CC Pos X: {sig}")
         elif self.learning_cc == "cc_pos_y":
             self.lbl_cc_y.setText(f"CC Pos Y: {sig}")
+        elif self.learning_cc == "cc_folder":
+            self.lbl_cc_folder.setText(f"CC Folder: {sig}")
         
         self.learning_cc = None
         if self.midi_thread:
