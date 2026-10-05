@@ -104,7 +104,7 @@ def auto_assign_midi(year):
         
     print(f"[Library] Auto-assign MIDI pour {year} ({len(config['years'][year])} fichiers)")
     
-    note = 36  # Start at C1
+    note = 28  # Start at E0 (Clavier 76 touches)
     for f in config["years"][year]:
         f["midi_note"] = note
         note += 1

@@ -216,8 +216,24 @@ class PlayerEngine:
         
         _log("Engine", f"  ❄ Frame figée → FrozenFrame-{self.current_frozen_idx} ({geometry.width()}x{geometry.height()})")
         self.current_frozen_idx = (self.current_frozen_idx + 1) % len(self.frozen_frames)
+
+    def leave_ghost(self):
+        """Laisse une copie (ghost) du calque actif à sa position actuelle (fonctionne pour vidéo et photo)."""
+        if not self._last_active_layer or not self._last_active_layer.widget.isVisible():
+            return
+            
+        widget = self._last_active_layer.widget
+        pixmap = widget.pixmap()
         
-    def play_media(self, filepath, in_point=0.0, video_width=0, video_height=0):
+        if pixmap is None or pixmap.isNull():
+            return
+            
+        geometry = widget.geometry()
+        frozen = self.frozen_frames[self.current_frozen_idx]
+        frozen.show_pixmap(pixmap, geometry)
+        self.current_frozen_idx = (self.current_frozen_idx + 1) % len(self.frozen_frames)
+        
+    def play_media(self, filepath, in_point=0.0, video_width=0, video_height=0, velocity=None):
         t0 = time.time()
         _log("Engine", "=" * 60)
         
@@ -225,7 +241,12 @@ class PlayerEngine:
         parent_rect = self.parent_widget.rect()
         pw, ph = parent_rect.width(), parent_rect.height()
         
-        scale = random.uniform(0.3, 0.7)
+        # Scale basé sur la vélocité si disponible, sinon aléatoire
+        if velocity is not None:
+            scale = 0.1 + (velocity / 127.0) * 1.5
+        else:
+            scale = random.uniform(0.3, 0.7)
+            
         w = int(pw * scale)
         
         # Calculer la hauteur selon le ratio si on le connaît déjà (évite le flash)

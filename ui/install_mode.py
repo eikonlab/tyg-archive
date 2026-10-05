@@ -104,7 +104,8 @@ class InstallMode(QWidget):
                     media["filepath"], 
                     media.get("in_point", 0.0),
                     media.get("width", 0),
-                    media.get("height", 0)
+                    media.get("height", 0),
+                    velocity
                 )
                 break
                 
@@ -165,7 +166,7 @@ class InstallMode(QWidget):
         
         # Figer avant de déplacer si les conditions sont remplies
         if moved_enough and time_enough:
-            self.engine._freeze_live()
+            self.engine.leave_ghost()
             self.last_ghost_time = now
             self.last_ghost_pos = (rect.x(), rect.y(), rect.width(), rect.height())
         # -------------------------------------------------------------
