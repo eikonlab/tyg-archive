@@ -217,7 +217,7 @@ class PlayerEngine:
         _log("Engine", f"  ❄ Frame figée → FrozenFrame-{self.current_frozen_idx} ({geometry.width()}x{geometry.height()})")
         self.current_frozen_idx = (self.current_frozen_idx + 1) % len(self.frozen_frames)
         
-    def play_media(self, filepath, in_point=0.0):
+    def play_media(self, filepath, in_point=0.0, video_width=0, video_height=0):
         t0 = time.time()
         _log("Engine", "=" * 60)
         
@@ -227,9 +227,17 @@ class PlayerEngine:
         
         scale = random.uniform(0.3, 0.7)
         w = int(pw * scale)
-        h = int(ph * scale)
-        x = random.randint(0, pw - w)
-        y = random.randint(0, ph - h)
+        
+        # Calculer la hauteur selon le ratio si on le connaît déjà (évite le flash)
+        if video_width > 0 and video_height > 0:
+            aspect = video_width / video_height
+            h = int(w / aspect)
+        else:
+            # Fallback 16:9 par défaut si inconnu
+            h = int(w / (16/9))
+            
+        x = random.randint(0, max(0, pw - w))
+        y = random.randint(0, max(0, ph - h))
         
         if _is_image(filepath):
             # --- AFFICHAGE IMAGE ---

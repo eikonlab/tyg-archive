@@ -10,20 +10,32 @@ VALID_EXTENSIONS = {".mp4", ".mov", ".mkv", ".jpg", ".jpeg", ".png", ".wav"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv"}
 
 
-def _get_video_duration(filepath):
-    """Récupère la durée d'une vidéo en secondes via ffprobe (si disponible)."""
-    try:
-        result = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", filepath],
-            capture_output=True, text=True, timeout=10
-        )
-        if result.returncode == 0:
-            data = json.loads(result.stdout)
-            duration = float(data.get("format", {}).get("duration", 0))
-            return duration
-    except (FileNotFoundError, subprocess.TimeoutExpired, json.JSONDecodeError, ValueError):
-        pass
-    return 0.0
+def _get_video_info(filepath):
+    """Récupère la durée et les dimensions d'une vidéo via ffprobe (avec chemins de secours)."""
+    ffprobe_paths = ["ffprobe", "/usr/local/bin/ffprobe", "/opt/homebrew/bin/ffprobe", "/opt/ffmpeg/bin/ffprobe"]
+    
+    for cmd in ffprobe_paths:
+        try:
+            result = subprocess.run(
+                [cmd, "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", filepath],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0:
+                data = json.loads(result.stdout)
+                duration = float(data.get("format", {}).get("duration", 0))
+                
+                width, height = 0, 0
+                for stream in data.get("streams", []):
+                    if stream.get("codec_type") == "video":
+                        width = int(stream.get("width", 0))
+                        height = int(stream.get("height", 0))
+                        break
+                        
+                return {"duration": duration, "width": width, "height": height}
+        except (FileNotFoundError, subprocess.TimeoutExpired, json.JSONDecodeError, ValueError):
+            continue
+            
+    return {"duration": 0.0, "width": 0, "height": 0}
 
 
 def scan_library(root_path):
@@ -101,8 +113,17 @@ def auto_assign_midi(year):
         
         # Randomiser les IN/OUT pour les vidéos
         ext = os.path.splitext(f["filepath"])[1].lower()
+        
+        # Par défaut, on initialise avec des dimensions nulles
+        f["width"] = 0
+        f["height"] = 0
+        
         if ext in VIDEO_EXTENSIONS:
-            duration = _get_video_duration(f["filepath"])
+            info = _get_video_info(f["filepath"])
+            duration = info["duration"]
+            f["width"] = info["width"]
+            f["height"] = info["height"]
+            
             if duration > 10:
                 # IN point : position aléatoire dans les premiers 80% du clip
                 # pour laisser au moins 20% de clip à jouer
@@ -115,12 +136,12 @@ def auto_assign_midi(year):
                 
                 f["in_point"] = in_point
                 f["out_point"] = out_point
-                print(f"  {os.path.basename(f['filepath'])}: IN={in_point}s OUT={out_point}s (durée={duration:.0f}s)")
+                print(f"  {os.path.basename(f['filepath'])}: IN={in_point}s OUT={out_point}s (durée={duration:.0f}s) ({f['width']}x{f['height']})")
             elif duration > 0:
                 # Clip court : on garde le début mais avec un out aléatoire
                 f["in_point"] = 0.0
                 f["out_point"] = round(random.uniform(duration * 0.3, duration), 1)
-                print(f"  {os.path.basename(f['filepath'])}: clip court, IN=0 OUT={f['out_point']}s")
+                print(f"  {os.path.basename(f['filepath'])}: clip court, IN=0 OUT={f['out_point']}s ({f['width']}x{f['height']})")
             else:
                 print(f"  {os.path.basename(f['filepath'])}: durée inconnue (ffprobe indisponible?)")
     

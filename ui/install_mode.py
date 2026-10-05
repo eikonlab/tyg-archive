@@ -1,4 +1,4 @@
-from PyQt5.QtWidgets import QWidget, QVBoxLayout, QComboBox, QHBoxLayout, QTextEdit, QPushButton
+from PyQt5.QtWidgets import QWidget, QVBoxLayout, QComboBox, QHBoxLayout, QTextEdit, QPushButton, QApplication
 from PyQt5.QtCore import Qt
 from core.player_engine import PlayerEngine
 from core.config import load_config
@@ -100,7 +100,12 @@ class InstallMode(QWidget):
             if media.get("midi_note") == note:
                 self.last_note_time = now
                 self.log_debug(f"Action: Lecture de {media['filepath']} (In: {media.get('in_point', 0.0)})")
-                self.engine.play_media(media["filepath"], media.get("in_point", 0.0))
+                self.engine.play_media(
+                    media["filepath"], 
+                    media.get("in_point", 0.0),
+                    media.get("width", 0),
+                    media.get("height", 0)
+                )
                 break
                 
     def on_midi_cc(self, channel, control, value):
@@ -145,6 +150,26 @@ class InstallMode(QWidget):
         rect = layer.widget.geometry()
         parent_rect = self.canvas.rect()
         
+        # --- Optimisation de l'effet d'image rémanente (ghosting) ---
+        import time
+        now = time.time()
+        last_g_time = getattr(self, 'last_ghost_time', 0)
+        last_g_pos = getattr(self, 'last_ghost_pos', (0, 0, 0, 0))
+        
+        dx = abs(rect.x() - last_g_pos[0])
+        dy = abs(rect.y() - last_g_pos[1])
+        dw = abs(rect.width() - last_g_pos[2])
+        
+        moved_enough = dx > 40 or dy > 40 or dw > 40
+        time_enough = (now - last_g_time) > 0.15 # 150ms intervalle minimum
+        
+        # Figer avant de déplacer si les conditions sont remplies
+        if moved_enough and time_enough:
+            self.engine._freeze_live()
+            self.last_ghost_time = now
+            self.last_ghost_pos = (rect.x(), rect.y(), rect.width(), rect.height())
+        # -------------------------------------------------------------
+        
         if is_scale:
             scale = 0.1 + (value / 127.0) * 1.5
             cx = rect.x() + rect.width() / 2
@@ -168,6 +193,10 @@ class InstallMode(QWidget):
         if hasattr(self, 'engine'):
             self.engine.cleanup()
         self.close()
+        
+        app = QApplication.instance()
+        if app:
+            app.quit()
         
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Escape:
