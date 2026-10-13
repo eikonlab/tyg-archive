@@ -4,22 +4,26 @@ This document provides a technical breakdown of the **TYG Archives** project, de
 
 ## Core Modules (`core/`)
 
-### 1. `player_engine.py` (VLC Integration)
-The `PlayerEngine` class manages the playback of media files using the `python-vlc` bindings.
-- **Layers:** It initializes with a fixed number of layers (default 3), represented by the `PlayerLayer` class.
-- **Round-Robin Playback:** When a new media file is triggered via `play_media`, it stops the oldest active layer, calculates a random size (30-70% of the screen) and position, assigns the new media to that layer, and raises its widget to the top of the stack.
-- **Dynamic Control:** Provides `get_last_active_layer()` so that CC messages from the MIDI controller can manipulate the currently active layer in real-time.
+### 1. `player_engine.py` (Polyphonic Player Engine)
+The `PlayerEngine` class manages simultaneous multi-clip playback using `python-vlc` offscreen instances combined with pure Qt widgets (`QLabel`) to prevent Cocoa z-order conflicts on macOS.
+- **Polyphonic Slots:** Manages up to 3 concurrent voice slots (`VoiceSlot`).
+- **Hold-to-play Model:** Clips only play while their MIDI note is held down. When `release_note()` is called on Note Off, the corresponding slot stops and is cleared from the canvas.
+- **Out-point Pause:** When a video reaches its configured `out_point`, playback pauses on the last frame as long as the key is still held down.
+- **Voice Stealing (FIFO):** If 3 voices are active and a 4th note is pressed, the oldest active voice is stopped and reassigned.
+- **Dynamic Audio Attenuation:** Automatically divides audio volume according to active audio voices (100% for 1 voice, 50% for 2, 33% for 3) to prevent acoustic distortion.
+- **Live Snapshot Rendering:** A unified Qt timer captures snapshots (~8 fps) from off-screen VLC decoders directly onto on-screen `QLabel` widgets.
+- **Ghosting / Mosaic:** Potentiometer movements leave persistent ghost frames in a background pool (`FrozenFrame`).
 
 ### 2. `library.py` (Media Management)
 Handles the discovery and synchronization of media files.
 - **`scan_library()`:** Walks through a specified root directory, identifies year-based folders (e.g., `2012`), and registers valid media files (`.mp4`, `.mov`, `.jpg`, `.wav`, etc.).
 - **`sync_library()`:** Merges newly discovered files with the existing `config.json` database, preserving manual edits (such as custom in/out points or manually assigned MIDI notes).
-- **`auto_assign_midi()`:** Automatically assigns sequential MIDI notes (starting from note 36 / C1) to all media files within a specified year.
+- **`auto_assign_midi()`:** Automatically assigns sequential MIDI notes (starting from note 28 / E0) to all media files within a specified year.
 
 ### 3. `midi_handler.py` (MIDI Listening Thread)
 Provides a QThread-based listener for MIDI input to avoid blocking the main PyQt UI thread.
-- **`MidiListener`:** Connects to a specified MIDI port using `mido`. It continuously listens for `note_on` and `control_change` events.
-- **Signals:** Emits PyQt signals (`note_on_signal` and `cc_signal`) which are intercepted by the UI components (like `InstallMode` and `SettingsWindow`) to trigger actions.
+- **`MidiListener`:** Connects to a specified MIDI port using `mido`. Continuously listens for `note_on`, `note_off`, and `control_change` events.
+- **Signals:** Emits PyQt signals (`note_on_signal`, `note_off_signal`, and `cc_signal`) intercepted by UI components.
 
 ### 4. `config.py` (Configuration Persistence)
 A simple utility script that loads and saves application state (like mapped CC controls, chosen MIDI device, and the media library database) to a `config.json` file.
@@ -42,16 +46,15 @@ The primary runtime environment for the exhibition.
 - **Full Screen Canvas:** Creates a borderless, black, full-screen canvas.
 - **MIDI Integration:** Starts the `MidiListener` thread on the configured port.
 - **Event Handling:** 
-  - On `note_on`, it checks the `config.json` library for the currently selected year. If the note matches a file, it asks the `PlayerEngine` to play it.
-  - On `control_change`, if the CC matches a learned control (scale, X, Y), it calculates a new geometry for the last active video layer and updates its position/size dynamically.
+  - On `note_on`, matches the note in `config.json` and calls `PlayerEngine.trigger_note()`.
+  - On `note_off`, calls `PlayerEngine.release_note()`.
+  - On `control_change`, modifies the geometry of the most recently triggered active voice (`get_last_active_layer()`), generating ghost frames if moved significantly.
 
-## Data Flow (Live Playback)
+## Data Flow (Live Polyphonic Playback)
 1. User selects a year from the combobox in **Install Mode**.
-2. User presses a key on the MIDI keyboard.
-3. `MidiListener` (on a background thread) captures `note_on` and emits a PyQt signal to `InstallMode`.
-4. `InstallMode` looks up the file associated with the note and year in `config.json`.
-5. `InstallMode` calls `PlayerEngine.play_media()`.
-6. `PlayerEngine` stops the oldest layer, sets a random size/position, and plays the new file.
-7. User turns a knob on the MIDI keyboard.
-8. `MidiListener` emits a `cc_signal`.
-9. `InstallMode` matches the CC number with the learned settings and calls `set_geometry()` on the active `PlayerLayer`, immediately changing its size or position.
+2. User presses and holds a key on the MIDI keyboard (`note_on`).
+3. `InstallMode` matches the file in `config.json` and calls `PlayerEngine.trigger_note()`.
+4. If less than 3 voices are active, an available slot plays the clip; if 3 are already active, the oldest voice is stopped (FIFO).
+5. User presses additional keys while holding: up to 3 clips play simultaneously, with audio automatically attenuated.
+6. When the user releases a key (`note_off`), `PlayerEngine.release_note()` stops that clip and removes it from the canvas.
+7. If the user turns a knob, `InstallMode` updates the size/position of the most recent active clip.

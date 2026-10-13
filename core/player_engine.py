@@ -12,12 +12,18 @@ import random
 # Extensions reconnues comme images (affichées via Qt, pas VLC)
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tiff", ".tif", ".webp"}
 
-# Nombre max de frames figées visibles à l'écran (mosaïque)
+# Extensions reconnues comme audio pur (jouées via VLC sans affichage)
+AUDIO_EXTENSIONS = {".wav", ".mp3", ".aif", ".aiff"}
+
+# Nombre maximum de voix simultanées
+MAX_VOICES = 3
+
+# Nombre max de frames figées visibles à l'écran (mosaïque / ghosting)
 MAX_FROZEN_FRAMES = 12
 
 # Intervalle de rafraîchissement du "live view" (ms)
-# ~7 fps — suffisant pour du contenu SD dans une installation
-LIVE_REFRESH_MS = 150
+# ~8 fps — fluide et léger pour 3 voix en simultané
+LIVE_REFRESH_MS = 120
 
 
 def _log(tag, msg):
@@ -38,29 +44,20 @@ def _file_info(filepath):
         return -1, f"ERREUR: {e}"
 
 
-def _read_speed_test(filepath, chunk_bytes=1024 * 512):
-    """Lit un petit morceau du fichier pour estimer la vitesse du disque."""
-    try:
-        t0 = time.time()
-        with open(filepath, "rb") as f:
-            data = f.read(chunk_bytes)
-        dt = time.time() - t0
-        if dt > 0:
-            speed_mb = (len(data) / (1024 * 1024)) / dt
-            return len(data), dt, speed_mb
-        return len(data), 0, float("inf")
-    except OSError as e:
-        return 0, 0, -1
-
-
 def _is_image(filepath):
     """Vérifie si le fichier est une image."""
     ext = os.path.splitext(filepath)[1].lower()
     return ext in IMAGE_EXTENSIONS
 
 
+def _is_audio(filepath):
+    """Vérifie si le fichier est un fichier audio pur."""
+    ext = os.path.splitext(filepath)[1].lower()
+    return ext in AUDIO_EXTENSIONS
+
+
 class FrozenFrame:
-    """Un QLabel qui affiche une frame figée (screenshot d'une vidéo ou image)."""
+    """Un QLabel qui affiche une frame figée (mosaïque d'arrière-plan)."""
     
     def __init__(self, parent_widget, frame_id=0):
         self.frame_id = frame_id
@@ -74,7 +71,7 @@ class FrozenFrame:
         self.label.setGeometry(geometry)
         self.label.setPixmap(pixmap)
         self.label.show()
-        self.label.raise_()
+        self.label.lower()  # Toujours sous les clips actifs
         
     def hide(self):
         self.label.hide()
@@ -88,351 +85,439 @@ class FrozenFrame:
         return self.label
 
 
-class PlayerEngine:
-    """Moteur de lecture.
+class VoiceSlot:
+    """Un slot polyphonique (voix) capable de jouer une vidéo, une image ou un audio."""
     
-    Architecture :
-    - VLC tourne HORS ÉCRAN (widget caché à -5000,-5000) pour le décodage vidéo
-    - Un QLabel "live_label" affiche la vidéo via des snapshots périodiques (~7fps)
-    - Les frozen frames sont de simples QLabels
-    - TOUT est rendu via Qt → pas de problème de z-order avec VLC sur macOS
-    """
-    
-    def __init__(self, parent_widget):
-        # VLC : désactivation de l'accélération matérielle
-        vlc_args = [
-            "--no-xlib",
-            "--avcodec-hw=none",
-            "--no-videotoolbox",
-            "--verbose=0",
-        ]
-        _log("Engine", f"Initialisation VLC avec args: {vlc_args}")
-        self.vlc_instance = vlc.Instance(*vlc_args)
+    def __init__(self, vlc_instance, parent_widget, slot_id=0):
+        self.slot_id = slot_id
+        self.vlc_instance = vlc_instance
+        self.parent_widget = parent_widget
         
-        # Player VLC HORS ÉCRAN (pour le décodage uniquement)
+        # Player VLC HORS ÉCRAN (décocage logiciel pour éviter les conflits z-order Cocoa)
         self._vlc_widget = QWidget(parent_widget)
-        self._vlc_widget.setGeometry(-5000, -5000, 720, 576)
-        self._vlc_widget.show()  # Doit être "visible" pour que VLC rende
-        self.player = self.vlc_instance.media_player_new()
+        self._vlc_widget.setGeometry(-5000 - slot_id * 1000, -5000, 720, 576)
+        self._vlc_widget.show()
         
+        self.player = self.vlc_instance.media_player_new()
         if sys.platform == "darwin":
             self.player.set_nsobject(int(self._vlc_widget.winId()))
         elif sys.platform.startswith("linux"):
             self.player.set_xwindow(int(self._vlc_widget.winId()))
         elif sys.platform == "win32":
             self.player.set_hwnd(int(self._vlc_widget.winId()))
-        
-        self.media_path = None
-        self._play_request_time = None
-        
-        # QLabel "live" : affiche la vidéo en cours via snapshots Qt
+            
+        # QLabel live affiché sur le canevas
         self.live_label = QLabel(parent_widget)
         self.live_label.setStyleSheet("background-color: black;")
         self.live_label.setScaledContents(True)
         self.live_label.hide()
         
-        # Pool de frames figées (mosaïque)
-        self.frozen_frames = [FrozenFrame(parent_widget, i) for i in range(MAX_FROZEN_FRAMES)]
-        self.current_frozen_idx = 0
+        # État
+        self.is_active = False
+        self.note = None
+        self.media_path = None
+        self.media_type = None  # "video", "image", "audio"
+        self.in_point = 0.0
+        self.out_point = 0.0
+        self.is_paused_on_out = False
+        self.play_request_time = None
+        self.video_aspect_adjusted = False
+        self.aspect_ratio = 16 / 9
         
-        self.parent_widget = parent_widget
-        self._last_active_layer = None
+    def play_video(self, filepath, in_point=0.0, out_point=0.0, geometry=None):
+        """Lance la lecture d'une vidéo dans ce slot."""
+        self.stop_playback_only()
         
-        # Dossier temporaire pour les snapshots VLC
-        self._snap_dir = tempfile.mkdtemp(prefix="tyg_snap_")
-        self._snap_counter = 0
+        self.media_path = filepath
+        self.media_type = "video"
+        self.in_point = in_point
+        self.out_point = out_point
+        self.is_paused_on_out = False
+        self.video_aspect_adjusted = False
+        self.play_request_time = time.time()
+        self.is_active = True
         
-        # Timer pour rafraîchir le "live view" avec des snapshots VLC
-        self._live_timer = QTimer()
-        self._live_timer.timeout.connect(self._refresh_live)
-        self._is_video_playing = False
+        # Préparation VLC
+        media = self.vlc_instance.media_new(filepath)
+        if in_point > 0.0:
+            media.add_option(f"start-time={in_point}")
+        media.add_option(":avcodec-hw=none")
+        media.add_option(":no-videotoolbox")
+        self.player.set_media(media)
+        self.player.play()
         
-        # Timer pour vérifier l'état VLC
-        self._state_check_timer = QTimer()
-        self._state_check_timer.timeout.connect(self._check_states)
-        self._pending_check_times = []
+        # Affichage du label Qt
+        if geometry:
+            self.live_label.setGeometry(geometry)
+        self.live_label.setStyleSheet("background-color: black;")
+        self.live_label.show()
+        self.live_label.raise_()
         
-        _log("Engine", f"VLC hors écran + {MAX_FROZEN_FRAMES} frozen frames")
-        _log("Engine", f"✅ Tout rendu via Qt (pas de surface VLC visible)")
-        _log("Engine", f"   Live refresh: {LIVE_REFRESH_MS}ms (~{1000//LIVE_REFRESH_MS} fps)")
+        _log(f"Slot-{self.slot_id}", f"▶ Play VIDEO: {os.path.basename(filepath)} (IN={in_point}s, OUT={out_point}s)")
+
+    def play_image(self, filepath, geometry=None):
+        """Affiche une image fixe dans ce slot."""
+        self.stop_playback_only()
         
-    def _take_snapshot(self):
-        """Capture une frame VLC et la retourne comme QPixmap."""
+        self.media_path = filepath
+        self.media_type = "image"
+        self.in_point = 0.0
+        self.out_point = 0.0
+        self.is_paused_on_out = False
+        self.play_request_time = time.time()
+        self.is_active = True
+        
+        pixmap = QPixmap(filepath)
+        if pixmap.isNull():
+            _log(f"Slot-{self.slot_id}", f"⚠ Erreur chargement image {filepath}")
+            self.stop()
+            return
+            
+        orig_w, orig_h = pixmap.width(), pixmap.height()
+        if orig_w > 1920 or orig_h > 1080:
+            pixmap = pixmap.scaled(1920, 1080, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            
+        if geometry:
+            parent_rect = self.parent_widget.rect()
+            pw, ph = parent_rect.width(), parent_rect.height()
+            if orig_h > 0:
+                aspect = orig_w / orig_h
+                w = geometry.width()
+                h = int(w / aspect)
+                if h > ph:
+                    h = ph
+                    w = int(h * aspect)
+                x = min(geometry.x(), max(0, pw - w))
+                y = min(geometry.y(), max(0, ph - h))
+                self.live_label.setGeometry(QRect(x, y, w, h))
+            else:
+                self.live_label.setGeometry(geometry)
+                
+        self.live_label.setPixmap(pixmap)
+        self.live_label.show()
+        self.live_label.raise_()
+        _log(f"Slot-{self.slot_id}", f"🖼 Affichage IMAGE: {os.path.basename(filepath)}")
+
+    def play_audio(self, filepath, in_point=0.0, out_point=0.0):
+        """Joue un fichier audio pur via VLC."""
+        self.stop_playback_only()
+        
+        self.media_path = filepath
+        self.media_type = "audio"
+        self.in_point = in_point
+        self.out_point = out_point
+        self.is_paused_on_out = False
+        self.play_request_time = time.time()
+        self.is_active = True
+        
+        self.live_label.hide()
+        
+        media = self.vlc_instance.media_new(filepath)
+        if in_point > 0.0:
+            media.add_option(f"start-time={in_point}")
+        self.player.set_media(media)
+        self.player.play()
+        _log(f"Slot-{self.slot_id}", f"🎵 Play AUDIO: {os.path.basename(filepath)}")
+
+    def pause_on_out(self):
+        """Fige la vidéo sur sa frame courante (atteinte du OUT point)."""
+        if self.is_paused_on_out:
+            return
+        self.is_paused_on_out = True
+        if self.media_type == "video":
+            self.player.pause()
+            _log(f"Slot-{self.slot_id}", f"⏸ Pause sur OUT-point atteint ({self.out_point}s)")
+
+    def set_volume(self, volume_percent):
+        """Règle le volume VLC (0 à 100)."""
+        vol = max(0, min(100, int(volume_percent)))
+        self.player.audio_set_volume(vol)
+
+    def stop_playback_only(self):
+        """Arrête le moteur VLC sans modifier la géométrie."""
+        if self.player.get_state() != vlc.State.Stopped:
+            self.player.stop()
+
+    def stop(self):
+        """Arrêt complet de ce slot (relâchement de touche ou vol de voix)."""
+        self.stop_playback_only()
+        self.live_label.hide()
+        self.live_label.clear()
+        self.is_active = False
+        self.note = None
+        self.media_path = None
+        self.media_type = None
+        self.is_paused_on_out = False
+        self.video_aspect_adjusted = False
+        _log(f"Slot-{self.slot_id}", f"⏹ Slot libéré et éteint")
+
+    def take_snapshot(self, snap_dir, counter):
+        """Prend un snapshot VLC pour rafraîchir le live_label."""
         state = self.player.get_state()
         if state not in (vlc.State.Playing, vlc.State.Paused):
             return None
-        
-        self._snap_counter += 1
-        snap_path = os.path.join(self._snap_dir, f"snap_{self._snap_counter}.png")
-        
-        result = self.player.video_take_snapshot(0, snap_path, 0, 0)
-        if result != 0:
+            
+        snap_path = os.path.join(snap_dir, f"snap_{self.slot_id}_{counter}.png")
+        res = self.player.video_take_snapshot(0, snap_path, 0, 0)
+        if res != 0:
             return None
-        
-        # Attendre que le fichier soit écrit
-        for _ in range(15):
+            
+        # Courte attente non bloquante de fichier (max 25ms)
+        for _ in range(5):
             if os.path.exists(snap_path) and os.path.getsize(snap_path) > 0:
                 break
-            time.sleep(0.01)
-        
+            time.sleep(0.005)
+            
         if not os.path.exists(snap_path) or os.path.getsize(snap_path) == 0:
             return None
             
         pixmap = QPixmap(snap_path)
-        
         try:
             os.remove(snap_path)
         except OSError:
             pass
-        
+            
         if pixmap.isNull():
             return None
             
         return pixmap
-    
-    def _refresh_live(self):
-        """Rafraîchit le QLabel live avec un snapshot VLC."""
-        if not self._is_video_playing:
-            return
-            
-        pixmap = self._take_snapshot()
-        if pixmap is not None:
-            self.live_label.setPixmap(pixmap)
-            if not self.live_label.isVisible():
-                self.live_label.show()
-    
-    def _freeze_live(self):
-        """Fige le contenu actuel du live_label comme frozen frame."""
-        if not self.live_label.isVisible():
-            return
-            
-        pixmap = self.live_label.pixmap()
-        if pixmap is None or pixmap.isNull():
-            return
-            
-        geometry = self.live_label.geometry()
-        frozen = self.frozen_frames[self.current_frozen_idx]
-        frozen.show_pixmap(pixmap, geometry)
-        
-        _log("Engine", f"  ❄ Frame figée → FrozenFrame-{self.current_frozen_idx} ({geometry.width()}x{geometry.height()})")
-        self.current_frozen_idx = (self.current_frozen_idx + 1) % len(self.frozen_frames)
 
-    def leave_ghost(self):
-        """Laisse une copie (ghost) du calque actif à sa position actuelle (fonctionne pour vidéo et photo)."""
-        if not self._last_active_layer or not self._last_active_layer.widget.isVisible():
-            return
-            
-        widget = self._last_active_layer.widget
-        pixmap = widget.pixmap()
+    # Interface de compatibilité CC (scale / position X/Y)
+    @property
+    def widget(self):
+        return self.live_label
+
+    def set_geometry(self, x, y, w, h):
+        self.live_label.setGeometry(QRect(x, y, w, h))
+
+    def cleanup(self):
+        self.stop()
+        if hasattr(self, 'player') and self.player:
+            self.player.release()
+            self.player = None
+
+
+class PlayerEngine:
+    """Moteur de lecture polyphonique (jusqu'à MAX_VOICES=3 clips simultanés).
+    
+    Architecture :
+    - 3 slots de voix indépendants (VoiceSlot)
+    - Décodage VLC hors-écran pour chaque slot
+    - Affichage 100% Qt (QLabel) pour éviter les conflits z-order sous macOS
+    - Rafraîchissement live cadencé par QTimer
+    - Gestion de polyphonie Hold-to-Play, vol de voix FIFO, et mixage audio dynamique
+    """
+    
+    def __init__(self, parent_widget):
+        self.parent_widget = parent_widget
         
-        if pixmap is None or pixmap.isNull():
-            return
-            
-        geometry = widget.geometry()
-        frozen = self.frozen_frames[self.current_frozen_idx]
-        frozen.show_pixmap(pixmap, geometry)
-        self.current_frozen_idx = (self.current_frozen_idx + 1) % len(self.frozen_frames)
+        # Initialisation VLC
+        vlc_args = [
+            "--no-xlib",
+            "--avcodec-hw=none",
+            "--no-videotoolbox",
+            "--verbose=0",
+        ]
+        _log("Engine", f"Initialisation VLC polyphonique (args: {vlc_args})")
+        self.vlc_instance = vlc.Instance(*vlc_args)
         
-    def play_media(self, filepath, in_point=0.0, video_width=0, video_height=0, velocity=None):
-        t0 = time.time()
+        # Initialisation des 3 slots
+        self.slots = [VoiceSlot(self.vlc_instance, parent_widget, i) for i in range(MAX_VOICES)]
+        
+        # Ordre des slots actifs pour FIFO (le plus ancien à l'index 0, le plus récent à l'index -1)
+        self.active_voice_order = []
+        
+        # Pool de frames figées (mosaïque d'arrière-plan / ghosting)
+        self.frozen_frames = [FrozenFrame(parent_widget, i) for i in range(MAX_FROZEN_FRAMES)]
+        self.current_frozen_idx = 0
+        
+        # Dossier temporaire pour snapshots
+        self._snap_dir = tempfile.mkdtemp(prefix="tyg_poly_snap_")
+        self._snap_counter = 0
+        
+        # Timer de rafraîchissement d'affichage
+        self._live_timer = QTimer()
+        self._live_timer.timeout.connect(self._refresh_active_videos)
+        self._live_timer.start(LIVE_REFRESH_MS)
+        
+        _log("Engine", f"✅ {MAX_VOICES} slots polyphoniques initialisés + {MAX_FROZEN_FRAMES} frozen frames")
+        _log("Engine", f"   Rafraîchissement: {LIVE_REFRESH_MS}ms")
+
+    def _update_audio_volumes(self):
+        """Atténuation audio dynamique selon le nombre de clips émettant du son."""
+        audio_slots = [s for s in self.slots if s.is_active and s.media_type in ("video", "audio")]
+        count = len(audio_slots)
+        
+        if count <= 1:
+            vol = 100
+        elif count == 2:
+            vol = 50
+        else:
+            vol = 33
+            
+        for s in audio_slots:
+            s.set_volume(vol)
+            
+        _log("Engine", f"Mixage audio : {count} voix active(s) -> volume à {vol}% par voix")
+
+    def trigger_note(self, note, filepath, in_point=0.0, out_point=0.0, video_width=0, video_height=0, velocity=None):
+        """Déclenche la lecture d'un média pour une note MIDI enfoncée."""
         _log("Engine", "=" * 60)
+        _log("Engine", f"Trigger Note On {note} -> {os.path.basename(filepath)}")
         
-        # Random position and scale
+        # Si cette note était déjà active dans un slot, on libère ce slot d'abord
+        existing_slot = next((s for s in self.slots if s.is_active and s.note == note), None)
+        if existing_slot:
+            existing_slot.stop()
+            if existing_slot in self.active_voice_order:
+                self.active_voice_order.remove(existing_slot)
+                
+        # Si tous les slots sont occupés : VOL DE VOIX (FIFO)
+        # On arrête le plus ancien slot actif
+        if len(self.active_voice_order) >= MAX_VOICES:
+            oldest_slot = self.active_voice_order.pop(0)
+            _log("Engine", f"Vol de voix FIFO : slot-{oldest_slot.slot_id} (note {oldest_slot.note}) arrêté")
+            oldest_slot.stop()
+            
+        # Trouver un slot libre
+        slot = next((s for s in self.slots if not s.is_active), None)
+        if not slot:
+            _log("Engine", "⚠ Aucun slot disponible malgré la libération !")
+            return
+            
+        slot.note = note
+        
+        # Calcul de la géométrie aléatoire avec prise en compte de la vélocité et du ratio
         parent_rect = self.parent_widget.rect()
         pw, ph = parent_rect.width(), parent_rect.height()
         
-        # Scale basé sur la vélocité si disponible, sinon aléatoire
         if velocity is not None:
             scale = 0.1 + (velocity / 127.0) * 1.5
         else:
             scale = random.uniform(0.3, 0.7)
             
         w = int(pw * scale)
-        
-        # Calculer la hauteur selon le ratio si on le connaît déjà (évite le flash)
         if video_width > 0 and video_height > 0:
             aspect = video_width / video_height
             h = int(w / aspect)
         else:
-            # Fallback 16:9 par défaut si inconnu
-            h = int(w / (16/9))
+            aspect = 16 / 9
+            h = int(w / aspect)
+            
+        if h > ph:
+            h = ph
+            w = int(h * aspect)
             
         x = random.randint(0, max(0, pw - w))
         y = random.randint(0, max(0, ph - h))
+        geometry = QRect(x, y, w, h)
         
+        # Lancement selon le type
         if _is_image(filepath):
-            # --- AFFICHAGE IMAGE ---
-            _log("Engine", f"play_media() IMAGE")
-            
-            # Figer le live actuel s'il est visible
-            self._freeze_live()
-            
-            # Stop any running video so it doesn't keep refreshing and popping to the front
-            self._is_video_playing = False
-            if self.player.get_state() != vlc.State.Stopped:
-                self.player.stop()
-            self.live_label.hide()
-            
-            basename = os.path.basename(filepath)
-            _log("Engine", f"  🖼 Chargement: {basename}")
-            
-            t_load = time.time()
-            pixmap = QPixmap(filepath)
-            dt_load = (time.time() - t_load) * 1000
-            
-            if pixmap.isNull():
-                _log("Engine", f"  ⚠ Impossible de charger l'image !")
-            else:
-                orig_w, orig_h = pixmap.width(), pixmap.height()
-                _log("Engine", f"  Chargée en {dt_load:.0f} ms — {orig_w}x{orig_h}")
-                
-                if orig_w > 1920 or orig_h > 1080:
-                    pixmap = pixmap.scaled(1920, 1080, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                    _log("Engine", f"  ↓ Réduite à {pixmap.width()}x{pixmap.height()}")
-                    
-                if orig_h > 0:
-                    aspect = orig_w / orig_h
-                    h = int(w / aspect)
-                    if h > ph:
-                        h = ph
-                        w = int(h * aspect)
-                    if x + w > pw: x = pw - w
-                    if y + h > ph: y = ph - h
-                
-                frozen = self.frozen_frames[self.current_frozen_idx]
-                frozen.show_pixmap(pixmap, QRect(x, y, w, h))
-                self._last_active_layer = frozen
-                
-                _log("Engine", f"  → FrozenFrame-{self.current_frozen_idx}")
-                self.current_frozen_idx = (self.current_frozen_idx + 1) % len(self.frozen_frames)
-            
+            slot.play_image(filepath, geometry)
+        elif _is_audio(filepath):
+            slot.play_audio(filepath, in_point, out_point)
         else:
-            # --- LECTURE VIDEO ---
-            _log("Engine", f"play_media() VIDEO")
+            slot.play_video(filepath, in_point, out_point, geometry)
             
-            # 1. Figer le live actuel
-            self._freeze_live()
-            
-            # 2. Info fichier
-            size_mb, ext = _file_info(filepath)
-            basename = os.path.basename(filepath)
-            old_media = os.path.basename(self.media_path) if self.media_path else "aucun"
-            _log("Engine", f"  ▶ {basename}")
-            _log("Engine", f"    (remplace: {old_media})")
-            if size_mb >= 0:
-                _log("Engine", f"    Taille: {size_mb:.1f} MB | Extension: {ext}")
-            
-            # Test vitesse disque
-            bytes_read, dt, speed_mb = _read_speed_test(filepath)
-            if speed_mb > 0:
-                _log("Engine", f"    Disque: {speed_mb:.1f} MB/s")
-            
-            self.media_path = filepath
-            
-            # 3. Changer le media VLC en s'assurant d'arrêter le précédent pour libérer la mémoire (buffers H264)
-            if self.player.get_state() != vlc.State.Stopped:
-                self.player.stop()
-                
-            media = self.player.get_instance().media_new(filepath)
-            media.add_option(f"start-time={in_point}")
-            media.add_option(":avcodec-hw=none")
-            media.add_option(":no-videotoolbox")
-            self.player.set_media(media)
-            self.player.play()
-            self._play_request_time = time.time()
-            self._is_video_playing = True
-            self._video_aspect_adjusted = False
-            
-            # 4. Positionner le live_label à l'endroit voulu
-            self.live_label.setGeometry(QRect(x, y, w, h))
-            self.live_label.setStyleSheet("background-color: black;")
-            self.live_label.show()
-            self.live_label.raise_()
-            self._last_active_layer = self
-            
-            # 5. Démarrer le timer de rafraîchissement live
-            if not self._live_timer.isActive():
-                self._live_timer.start(LIVE_REFRESH_MS)
-            
-            # Programmer des vérifications d'état
-            self._pending_check_times = [500, 1000, 3000]
-            if not self._state_check_timer.isActive():
-                self._state_check_timer.start(100)
-        
-        dt_total = (time.time() - t0) * 1000
-        _log("Engine", f"play_media() terminé en {dt_total:.0f} ms")
+        self.active_voice_order.append(slot)
+        self._update_audio_volumes()
 
-    def _check_states(self):
-        """Vérifie périodiquement l'état du player VLC."""
-        if not self._pending_check_times:
-            self._state_check_timer.stop()
-            return
-            
-        if self._play_request_time is None:
-            self._state_check_timer.stop()
-            return
-            
-        now = time.time()
-        elapsed_ms = (now - self._play_request_time) * 1000
-        
-        if elapsed_ms >= self._pending_check_times[0]:
-            tag = "Engine"
-            state = self.player.get_state()
-            state_names = {
-                vlc.State.NothingSpecial: "NothingSpecial",
-                vlc.State.Opening: "Opening",
-                vlc.State.Buffering: "Buffering", 
-                vlc.State.Playing: "Playing",
-                vlc.State.Paused: "Paused",
-                vlc.State.Stopped: "Stopped",
-                vlc.State.Ended: "Ended",
-                vlc.State.Error: "Error",
-            }
-            state_name = state_names.get(state, str(state))
-            _log(tag, f"--- État VLC: {state_name} (après {self._pending_check_times[0]} ms) ---")
-            
-            if state == vlc.State.Playing:
-                vw = self.player.video_get_width()
-                vh = self.player.video_get_height()
-                fps = self.player.get_fps()
-                if vw and vh:
-                    _log(tag, f"    {vw}x{vh} @ {fps:.0f}fps")
-                    if not getattr(self, '_video_aspect_adjusted', False):
-                        self._video_aspect_adjusted = True
+    def release_note(self, note):
+        """Arrête le clip associé à la note relâchée (Note Off)."""
+        slot = next((s for s in self.slots if s.is_active and s.note == note), None)
+        if slot:
+            _log("Engine", f"Note Off {note} -> arrêt slot-{slot.slot_id}")
+            slot.stop()
+            if slot in self.active_voice_order:
+                self.active_voice_order.remove(slot)
+            self._update_audio_volumes()
+
+    def _refresh_active_videos(self):
+        """Timer : rafraîchit les snapshots de tous les slots vidéo actifs."""
+        for slot in self.slots:
+            if not slot.is_active or slot.media_type != "video":
+                continue
+                
+            # Vérifier l'atteinte du OUT-point
+            if slot.out_point > slot.in_point:
+                curr_ms = slot.player.get_time()
+                if curr_ms > 0 and curr_ms >= int(slot.out_point * 1000):
+                    if not slot.is_paused_on_out:
+                        # Capture finale sur l'out-point puis pause
+                        self._snap_counter += 1
+                        pixmap = slot.take_snapshot(self._snap_dir, self._snap_counter)
+                        if pixmap:
+                            slot.live_label.setPixmap(pixmap)
+                        slot.pause_on_out()
+                    continue
+                    
+            # Si le lecteur est arrivé à la fin physique du média
+            if slot.player.get_state() == vlc.State.Ended:
+                if not slot.is_paused_on_out:
+                    slot.pause_on_out()
+                continue
+                
+            if slot.is_paused_on_out:
+                continue
+                
+            # Snapshot périodique
+            self._snap_counter += 1
+            pixmap = slot.take_snapshot(self._snap_dir, self._snap_counter)
+            if pixmap is not None:
+                slot.live_label.setPixmap(pixmap)
+                
+                # Ajustement de l'aspect ratio dès la première frame valide reçue
+                if not slot.video_aspect_adjusted:
+                    vw = slot.player.video_get_width()
+                    vh = slot.player.video_get_height()
+                    if vw > 0 and vh > 0:
+                        slot.video_aspect_adjusted = True
                         aspect = vw / vh
-                        rect = self.live_label.geometry()
+                        rect = slot.live_label.geometry()
                         cx = rect.x() + rect.width() / 2
                         cy = rect.y() + rect.height() / 2
                         new_w = rect.width()
                         new_h = int(new_w / aspect)
-                        self.live_label.setGeometry(QRect(int(cx - new_w/2), int(cy - new_h/2), new_w, new_h))
-            
-            self._pending_check_times.pop(0)
-            
-        if not self._pending_check_times:
-            self._state_check_timer.stop()
+                        slot.live_label.setGeometry(QRect(int(cx - new_w / 2), int(cy - new_h / 2), new_w, new_h))
 
-    # --- Interface pour les CC MIDI (scale/position) ---
+    # --- Gestion CC MIDI & Ghosting ---
     
-    @property
-    def widget(self):
-        """Pour la compatibilité avec le CC handler d'install_mode."""
-        return self.live_label
-    
-    def set_geometry(self, x, y, w, h):
-        """Pour la compatibilité avec le CC handler d'install_mode."""
-        self.live_label.setGeometry(QRect(x, y, w, h))
-
     def get_last_active_layer(self):
-        return self._last_active_layer
+        """Retourne la voix active la plus récente parmi celles encore maintenues."""
+        if self.active_voice_order:
+            return self.active_voice_order[-1]
+        return None
+
+    def leave_ghost(self):
+        """Laisse une copie figée du clip actif le plus récent dans la mosaïque."""
+        layer = self.get_last_active_layer()
+        if not layer or not layer.widget.isVisible():
+            return
+            
+        pixmap = layer.widget.pixmap()
+        if pixmap is None or pixmap.isNull():
+            return
+            
+        geometry = layer.widget.geometry()
+        frozen = self.frozen_frames[self.current_frozen_idx]
+        frozen.show_pixmap(pixmap, geometry)
+        _log("Engine", f"  ❄ Trace rémanente (ghost) -> FrozenFrame-{self.current_frozen_idx}")
+        self.current_frozen_idx = (self.current_frozen_idx + 1) % len(self.frozen_frames)
+
+    # Rétro-compatibilité pour éventuel appel unitaire play_media
+    def play_media(self, filepath, in_point=0.0, video_width=0, video_height=0, velocity=None):
+        self.trigger_note(0, filepath, in_point=in_point, out_point=0.0, video_width=video_width, video_height=video_height, velocity=velocity)
 
     def cleanup(self):
-        self._is_video_playing = False
+        """Arrêt propre et libération des ressources."""
+        _log("Engine", "Nettoyage complet de l'Engine")
         if self._live_timer.isActive():
             self._live_timer.stop()
-        if self._state_check_timer.isActive():
-            self._state_check_timer.stop()
-        if hasattr(self, 'player') and self.player:
-            self.player.stop()
-            self.player.release()
-            self.player = None
+        for slot in self.slots:
+            slot.cleanup()
+        self.slots.clear()
+        self.active_voice_order.clear()
+        if hasattr(self, 'vlc_instance') and self.vlc_instance:
+            self.vlc_instance.release()
+            self.vlc_instance = None

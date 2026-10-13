@@ -73,7 +73,8 @@ class InstallMode(QWidget):
         port = self.config.get("midi_input", "")
         if port:
             self.midi_thread = MidiListener(port)
-            self.midi_thread.note_on_signal.connect(self.on_midi_note)
+            self.midi_thread.note_on_signal.connect(self.on_midi_note_on)
+            self.midi_thread.note_off_signal.connect(self.on_midi_note_off)
             self.midi_thread.cc_signal.connect(self.on_midi_cc)
             self.midi_thread.log_signal.connect(self.log_debug)
             self.midi_thread.start()
@@ -85,29 +86,40 @@ class InstallMode(QWidget):
         scrollbar = self.debug_log.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
             
-    def on_midi_note(self, note, velocity):
+    def on_midi_note_on(self, note, velocity):
         import time
         now = time.time()
-        if now - getattr(self, 'last_note_time', 0) < 0.3:
-            self.log_debug(f"Action ignorée: anti-surcharge (note {note})")
-            return
+        last_notes = getattr(self, '_last_note_times', {})
+        if note in last_notes and (now - last_notes[note]) < 0.05:
+            return  # Anti-rebond par note individuelle (< 50ms)
+        last_notes[note] = now
+        self._last_note_times = last_notes
         
         year = self.year_combo.currentText()
-        if not year: return
+        if not year:
+            return
         
         media_list = self.config["years"].get(year, [])
         for media in media_list:
             if media.get("midi_note") == note:
-                self.last_note_time = now
-                self.log_debug(f"Action: Lecture de {media['filepath']} (In: {media.get('in_point', 0.0)})")
-                self.engine.play_media(
+                self.log_debug(f"Action: Note On {note} -> {media['filepath']} (In: {media.get('in_point', 0.0)}, Out: {media.get('out_point', 0.0)})")
+                self.engine.trigger_note(
+                    note,
                     media["filepath"], 
                     media.get("in_point", 0.0),
+                    media.get("out_point", 0.0),
                     media.get("width", 0),
                     media.get("height", 0),
                     velocity
                 )
                 break
+
+    def on_midi_note_off(self, note):
+        self.log_debug(f"Action: Note Off {note}")
+        self.engine.release_note(note)
+
+    # Alias pour compatibilité
+    on_midi_note = on_midi_note_on
                 
     def on_midi_cc(self, channel, control, value):
         cc_scale = self.config.get("cc_scale") or 74

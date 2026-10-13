@@ -3,6 +3,7 @@ from PyQt5.QtCore import QThread, pyqtSignal
 
 class MidiListener(QThread):
     note_on_signal = pyqtSignal(int, int) # note, velocity
+    note_off_signal = pyqtSignal(int)     # note
     cc_signal = pyqtSignal(int, int, int) # channel, control, value
     log_signal = pyqtSignal(str) # log messages
     
@@ -25,6 +26,9 @@ class MidiListener(QThread):
                         if msg.type == 'note_on' and msg.velocity > 0:
                             self.log_signal.emit(f"MIDI In -> Note On: {msg.note}, Vel: {msg.velocity}")
                             self.note_on_signal.emit(msg.note, msg.velocity)
+                        elif msg.type == 'note_off' or (msg.type == 'note_on' and msg.velocity == 0):
+                            self.log_signal.emit(f"MIDI In -> Note Off: {msg.note}")
+                            self.note_off_signal.emit(msg.note)
                         elif msg.type == 'control_change':
                             self.log_signal.emit(f"MIDI In -> CC: {msg.control} (Ch {msg.channel}), Val: {msg.value}")
                             self.cc_signal.emit(msg.channel, msg.control, msg.value)
