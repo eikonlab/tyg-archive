@@ -15,8 +15,8 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tiff", ".tif", ".
 # Extensions reconnues comme audio pur (jouées via VLC sans affichage)
 AUDIO_EXTENSIONS = {".wav", ".mp3", ".aif", ".aiff"}
 
-# Nombre maximum de voix simultanées
-MAX_VOICES = 3
+# Nombre maximum de voix simultanées (1 = monophonique, optimisé pour Mac Mini)
+MAX_VOICES = 1
 
 # Nombre max de frames figées visibles à l'écran (mosaïque / ghosting)
 MAX_FROZEN_FRAMES = 12
@@ -298,14 +298,14 @@ class VoiceSlot:
 
 
 class PlayerEngine:
-    """Moteur de lecture polyphonique (jusqu'à MAX_VOICES=3 clips simultanés).
+    """Moteur de lecture monophonique (1 seule voix active, priorité à la dernière note).
     
     Architecture :
-    - 3 slots de voix indépendants (VoiceSlot)
-    - Décodage VLC hors-écran pour chaque slot
+    - 1 slot de voix (VoiceSlot) optimisé pour préserver le CPU/GPU sur Mac Mini
+    - Décodage VLC hors-écran
     - Affichage 100% Qt (QLabel) pour éviter les conflits z-order sous macOS
     - Rafraîchissement live cadencé par QTimer
-    - Gestion de polyphonie Hold-to-Play, vol de voix FIFO, et mixage audio dynamique
+    - Priorité à la dernière note enfoncée (Hold-to-Play monophonique)
     """
     
     def __init__(self, parent_widget):
@@ -318,13 +318,13 @@ class PlayerEngine:
             "--no-videotoolbox",
             "--verbose=0",
         ]
-        _log("Engine", f"Initialisation VLC polyphonique (args: {vlc_args})")
+        _log("Engine", f"Initialisation VLC monophonique (args: {vlc_args})")
         self.vlc_instance = vlc.Instance(*vlc_args)
         
-        # Initialisation des 3 slots
+        # Initialisation du slot unique
         self.slots = [VoiceSlot(self.vlc_instance, parent_widget, i) for i in range(MAX_VOICES)]
         
-        # Ordre des slots actifs pour FIFO (le plus ancien à l'index 0, le plus récent à l'index -1)
+        # Ordre des slots actifs (au plus 1 voix en monophonie)
         self.active_voice_order = []
         
         # Pool de frames figées (mosaïque d'arrière-plan / ghosting)
@@ -332,7 +332,7 @@ class PlayerEngine:
         self.current_frozen_idx = 0
         
         # Dossier temporaire pour snapshots
-        self._snap_dir = tempfile.mkdtemp(prefix="tyg_poly_snap_")
+        self._snap_dir = tempfile.mkdtemp(prefix="tyg_snap_")
         self._snap_counter = 0
         
         # Timer de rafraîchissement d'affichage
@@ -340,51 +340,27 @@ class PlayerEngine:
         self._live_timer.timeout.connect(self._refresh_active_videos)
         self._live_timer.start(LIVE_REFRESH_MS)
         
-        _log("Engine", f"✅ {MAX_VOICES} slots polyphoniques initialisés + {MAX_FROZEN_FRAMES} frozen frames")
+        _log("Engine", f"✅ Moteur monophonique initialisé (1 voix max) + {MAX_FROZEN_FRAMES} frozen frames")
         _log("Engine", f"   Rafraîchissement: {LIVE_REFRESH_MS}ms")
 
     def _update_audio_volumes(self):
-        """Atténuation audio dynamique selon le nombre de clips émettant du son."""
-        audio_slots = [s for s in self.slots if s.is_active and s.media_type in ("video", "audio")]
-        count = len(audio_slots)
-        
-        if count <= 1:
-            vol = 100
-        elif count == 2:
-            vol = 50
-        else:
-            vol = 33
-            
-        for s in audio_slots:
-            s.set_volume(vol)
-            
-        _log("Engine", f"Mixage audio : {count} voix active(s) -> volume à {vol}% par voix")
+        """En mode monophonique, volume à 100% pour la voix active."""
+        for s in self.slots:
+            if s.is_active and s.media_type in ("video", "audio"):
+                s.set_volume(100)
 
     def trigger_note(self, note, filepath, in_point=0.0, out_point=0.0, video_width=0, video_height=0, velocity=None):
-        """Déclenche la lecture d'un média pour une note MIDI enfoncée."""
+        """Déclenche la lecture d'un média pour une note MIDI enfoncée (monophonique : coupe toute note précédente)."""
         _log("Engine", "=" * 60)
-        _log("Engine", f"Trigger Note On {note} -> {os.path.basename(filepath)}")
+        _log("Engine", f"Trigger Note On {note} (Monophonique) -> {os.path.basename(filepath)}")
         
-        # Si cette note était déjà active dans un slot, on libère ce slot d'abord
-        existing_slot = next((s for s in self.slots if s.is_active and s.note == note), None)
-        if existing_slot:
-            existing_slot.stop()
-            if existing_slot in self.active_voice_order:
-                self.active_voice_order.remove(existing_slot)
-                
-        # Si tous les slots sont occupés : VOL DE VOIX (FIFO)
-        # On arrête le plus ancien slot actif
-        if len(self.active_voice_order) >= MAX_VOICES:
-            oldest_slot = self.active_voice_order.pop(0)
-            _log("Engine", f"Vol de voix FIFO : slot-{oldest_slot.slot_id} (note {oldest_slot.note}) arrêté")
-            oldest_slot.stop()
+        # Coupe immédiatement la note active précédente pour ne garder que la dernière note
+        for s in self.slots:
+            if s.is_active:
+                s.stop()
+        self.active_voice_order.clear()
             
-        # Trouver un slot libre
-        slot = next((s for s in self.slots if not s.is_active), None)
-        if not slot:
-            _log("Engine", "⚠ Aucun slot disponible malgré la libération !")
-            return
-            
+        slot = self.slots[0]
         slot.note = note
         
         # Calcul de la géométrie aléatoire avec prise en compte de la vélocité et du ratio
@@ -424,13 +400,12 @@ class PlayerEngine:
         self._update_audio_volumes()
 
     def release_note(self, note):
-        """Arrête le clip associé à la note relâchée (Note Off)."""
-        slot = next((s for s in self.slots if s.is_active and s.note == note), None)
-        if slot:
+        """Arrête le clip associé à la note relâchée uniquement si c'est la note active courante."""
+        slot = self.slots[0]
+        if slot.is_active and slot.note == note:
             _log("Engine", f"Note Off {note} -> arrêt slot-{slot.slot_id}")
             slot.stop()
-            if slot in self.active_voice_order:
-                self.active_voice_order.remove(slot)
+            self.active_voice_order.clear()
             self._update_audio_volumes()
 
     def _refresh_active_videos(self):

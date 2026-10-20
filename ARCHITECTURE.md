@@ -4,14 +4,13 @@ This document provides a technical breakdown of the **TYG Archives** project, de
 
 ## Core Modules (`core/`)
 
-### 1. `player_engine.py` (Polyphonic Player Engine)
-The `PlayerEngine` class manages simultaneous multi-clip playback using `python-vlc` offscreen instances combined with pure Qt widgets (`QLabel`) to prevent Cocoa z-order conflicts on macOS.
-- **Polyphonic Slots:** Manages up to 3 concurrent voice slots (`VoiceSlot`).
-- **Hold-to-play Model:** Clips only play while their MIDI note is held down. When `release_note()` is called on Note Off, the corresponding slot stops and is cleared from the canvas.
+### 1. `player_engine.py` (Monophonic Player Engine)
+The `PlayerEngine` class manages single-clip monophonic playback (last note priority) using a lightweight `python-vlc` offscreen instance combined with pure Qt widgets (`QLabel`) to prevent Cocoa z-order conflicts and preserve Mac Mini CPU/GPU resources.
+- **Monophonic Slot:** Manages 1 concurrent voice slot (`VoiceSlot`, `MAX_VOICES = 1`).
+- **Hold-to-play & Last Note Priority:** Clips only play while their MIDI note is held down. When a new key is pressed, the previous clip is immediately stopped, giving instant priority to the last note. When `release_note()` is called on Note Off, playback stops if the released note matches the active clip.
 - **Out-point Pause:** When a video reaches its configured `out_point`, playback pauses on the last frame as long as the key is still held down.
-- **Voice Stealing (FIFO):** If 3 voices are active and a 4th note is pressed, the oldest active voice is stopped and reassigned.
-- **Dynamic Audio Attenuation:** Automatically divides audio volume according to active audio voices (100% for 1 voice, 50% for 2, 33% for 3) to prevent acoustic distortion.
-- **Live Snapshot Rendering:** A unified Qt timer captures snapshots (~8 fps) from off-screen VLC decoders directly onto on-screen `QLabel` widgets.
+- **Full Audio Dynamic Range:** Always plays at 100% volume for the single active voice.
+- **Live Snapshot Rendering:** A unified Qt timer captures snapshots (~8 fps) from off-screen VLC decoder directly onto on-screen `QLabel` widgets.
 - **Ghosting / Mosaic:** Potentiometer movements leave persistent ghost frames in a background pool (`FrozenFrame`).
 
 ### 2. `library.py` (Media Management)
@@ -54,11 +53,11 @@ The primary runtime environment for the exhibition.
   - On `control_change`, modifies the geometry of the most recently triggered active voice (`get_last_active_layer()`), generating ghost frames if moved significantly.
   - On `pitchwheel`, switches folders/years (UP = next year, DOWN = previous year, infinite loop). Features progressive acceleration (single step on tap, accelerating repeat when held) and displays the folder name in a centered cinematic HUD overlay (`YearHUDOverlay`) with scale punch and fade-out animations.
 
-## Data Flow (Live Polyphonic Playback)
-1. User selects a year from the combobox in **Install Mode**.
+## Data Flow (Live Monophonic Playback)
+1. User selects a year from the combobox (or via pitchwheel) in **Install Mode**.
 2. User presses and holds a key on the MIDI keyboard (`note_on`).
 3. `InstallMode` matches the file in `config.json` and calls `PlayerEngine.trigger_note()`.
-4. If less than 3 voices are active, an available slot plays the clip; if 3 are already active, the oldest voice is stopped (FIFO).
-5. User presses additional keys while holding: up to 3 clips play simultaneously, with audio automatically attenuated.
-6. When the user releases a key (`note_off`), `PlayerEngine.release_note()` stops that clip and removes it from the canvas.
-7. If the user turns a knob, `InstallMode` updates the size/position of the most recent active clip.
+4. Any currently playing clip is stopped immediately, and the newly triggered clip starts playing in the single voice slot.
+5. If the user presses another key while holding: the previous clip cuts off immediately, and the new clip takes over (last note priority).
+6. When the user releases a key (`note_off`), if it matches the active clip, `PlayerEngine.release_note()` stops playback and clears the canvas.
+7. If the user turns a knob, `InstallMode` updates the size/position of the active clip.

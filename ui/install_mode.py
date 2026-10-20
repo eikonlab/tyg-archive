@@ -71,9 +71,9 @@ class InstallMode(QWidget):
         
         self.engine = PlayerEngine(self.canvas)
 
-        # Overlay HUD pour le nom du dossier / année
-        self.year_hud = YearHUDOverlay(self)
-        self.year_hud.setGeometry(self.rect())
+        # Overlay HUD pour le nom du dossier / année (placé sur le canvas vidéo)
+        self.year_hud = YearHUDOverlay(self.canvas)
+        self.year_hud.setGeometry(self.canvas.rect())
 
         # Paramètres d'accélération progressive de la pitchwheel
         self.PITCH_DEADZONE = 1200       # Zone morte pour éviter tout faux déclenchement au repos
@@ -105,6 +105,12 @@ class InstallMode(QWidget):
             self.midi_thread.start()
         else:
             self.log_debug("Aucun port MIDI configuré dans config.json")
+            
+        # Affichage du dossier initial au lancement
+        current_year = self.year_combo.currentText()
+        if current_year:
+            self.year_hud.display_year(current_year)
+            self.year_hud.release_pitchwheel()
             
     def log_debug(self, message):
         self.debug_log.append(message)
@@ -154,6 +160,8 @@ class InstallMode(QWidget):
                     media.get("height", 0),
                     velocity
                 )
+                if hasattr(self, 'year_hud') and self.year_hud and self.year_hud.isVisible():
+                    self.year_hud.raise_()
                 break
         if not found:
             self.log_debug(f"Note {note} reçue (Vel: {velocity}) mais aucun média assigné pour l'année {year}")
@@ -314,8 +322,8 @@ class InstallMode(QWidget):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        if hasattr(self, 'year_hud') and self.year_hud:
-            self.year_hud.setGeometry(self.rect())
+        if hasattr(self, 'year_hud') and self.year_hud and hasattr(self, 'canvas'):
+            self.year_hud.setGeometry(self.canvas.rect())
             self.year_hud.raise_()
 
     def close_and_stop(self):
