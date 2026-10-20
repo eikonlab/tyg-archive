@@ -1,8 +1,10 @@
+import time
 from PyQt5.QtWidgets import QWidget, QVBoxLayout, QComboBox, QHBoxLayout, QTextEdit, QPushButton, QApplication
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QTimer
 from core.player_engine import PlayerEngine
 from core.config import load_config
 from core.midi_handler import MidiListener
+from ui.year_hud import YearHUDOverlay
 
 class InstallMode(QWidget):
     def __init__(self):
@@ -68,6 +70,27 @@ class InstallMode(QWidget):
         self.setLayout(layout)
         
         self.engine = PlayerEngine(self.canvas)
+
+        # Overlay HUD pour le nom du dossier / année
+        self.year_hud = YearHUDOverlay(self)
+        self.year_hud.setGeometry(self.rect())
+
+        # Paramètres d'accélération progressive de la pitchwheel
+        self.PITCH_DEADZONE = 1200       # Zone morte pour éviter tout faux déclenchement au repos
+        self.PITCH_INITIAL_DELAY = 0.38  # Délai initial (380ms) avant le début de la répétition
+        self.PITCH_RAMP_UP_TIME = 2.2   # Temps pour atteindre la cadence maximale
+        self.PITCH_MAX_INTERVAL = 0.35  # Intervalle lent (350ms par cran)
+        self.PITCH_MIN_INTERVAL = 0.06  # Intervalle rapide (60ms par cran)
+
+        self._pitch_active = False
+        self._pitch_dir = 0
+        self._pitch_val = 0
+        self._pitch_start_time = 0.0
+        self._pitch_last_step_time = 0.0
+
+        self._pitch_timer = QTimer(self)
+        self._pitch_timer.setInterval(16)  # ~60 Hz pour évaluation fluide
+        self._pitch_timer.timeout.connect(self._on_pitch_tick)
         
         # MIDI Setup
         self.midi_thread = None
@@ -77,6 +100,7 @@ class InstallMode(QWidget):
             self.midi_thread.note_on_signal.connect(self.on_midi_note_on)
             self.midi_thread.note_off_signal.connect(self.on_midi_note_off)
             self.midi_thread.cc_signal.connect(self.on_midi_cc)
+            self.midi_thread.pitchwheel_signal.connect(self.on_midi_pitchwheel)
             self.midi_thread.log_signal.connect(self.log_debug)
             self.midi_thread.start()
         else:
@@ -96,6 +120,11 @@ class InstallMode(QWidget):
                     slot.stop()
             self.engine.active_voice_order.clear()
             self.engine._update_audio_volumes()
+        if hasattr(self, 'year_hud') and self.year_hud:
+            self.year_hud.display_year(year)
+            self.year_hud.raise_()
+            if not getattr(self, '_pitch_active', False):
+                self.year_hud.release_pitchwheel()
 
     def on_midi_note_on(self, note, velocity):
         import time
@@ -215,7 +244,83 @@ class InstallMode(QWidget):
             y = int((value / 127.0) * (parent_rect.height() - rect.height()))
             layer.set_geometry(rect.x(), y, rect.width(), rect.height())
             
+    def on_midi_pitchwheel(self, channel, pitch):
+        if abs(pitch) < self.PITCH_DEADZONE:
+            if self._pitch_active:
+                self._pitch_active = False
+                self._pitch_timer.stop()
+                if hasattr(self, 'year_hud') and self.year_hud:
+                    self.year_hud.release_pitchwheel()
+            return
+
+        # Pitchwheel vers le HAUT (positif) = Dossier suivant (ex: 2021 -> 2022)
+        # Pitchwheel vers le BAS (négatif) = Dossier précédent (ex: 2022 -> 2021)
+        direction = 1 if pitch > 0 else -1
+
+        if not self._pitch_active or direction != self._pitch_dir:
+            self._pitch_active = True
+            self._pitch_dir = direction
+            self._pitch_val = pitch
+            now = time.time()
+            self._pitch_start_time = now
+            self._pitch_last_step_time = now
+            if hasattr(self, 'year_hud') and self.year_hud:
+                self.year_hud.cancel_fade()
+            # Déclenchement immédiat du premier cran (facile pour monter/descendre d'un seul cran)
+            self.step_year(direction)
+            if not self._pitch_timer.isActive():
+                self._pitch_timer.start()
+        else:
+            # Maintenu dans la même direction : mise à jour de la déflexion pour l'accélération
+            self._pitch_val = pitch
+
+    def _on_pitch_tick(self):
+        if not self._pitch_active:
+            self._pitch_timer.stop()
+            return
+
+        now = time.time()
+        elapsed = now - self._pitch_start_time
+        if elapsed < self.PITCH_INITIAL_DELAY:
+            return  # Période de grâce pour permettre un seul cran facilement
+
+        # Intensité de déflexion (0.0 à 1.0)
+        deflection = max(0.0, min(1.0, (abs(self._pitch_val) - self.PITCH_DEADZONE) / (8191.0 - self.PITCH_DEADZONE)))
+        # Progression temporelle pour l'accélération progressive (0.0 à 1.0)
+        time_progress = min(1.0, (elapsed - self.PITCH_INITIAL_DELAY) / self.PITCH_RAMP_UP_TIME)
+
+        speed_factor = deflection * (0.2 + 0.8 * (time_progress ** 1.3))
+        speed_factor = max(0.0, min(1.0, speed_factor))
+        interval = self.PITCH_MAX_INTERVAL - speed_factor * (self.PITCH_MAX_INTERVAL - self.PITCH_MIN_INTERVAL)
+
+        if (now - self._pitch_last_step_time) >= interval:
+            self._pitch_last_step_time = now
+            self.step_year(self._pitch_dir)
+
+    def step_year(self, direction):
+        if not self.years:
+            return
+        count = len(self.years)
+        current_idx = self.year_combo.currentIndex()
+        if current_idx < 0:
+            current_idx = 0
+        # Boucle circulaire infinie
+        new_idx = (current_idx + direction) % count
+        self.year_combo.setCurrentIndex(new_idx)
+        new_year = self.year_combo.currentText()
+        if hasattr(self, 'year_hud') and self.year_hud:
+            self.year_hud.display_year(new_year)
+            self.year_hud.raise_()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, 'year_hud') and self.year_hud:
+            self.year_hud.setGeometry(self.rect())
+            self.year_hud.raise_()
+
     def close_and_stop(self):
+        if hasattr(self, '_pitch_timer') and self._pitch_timer:
+            self._pitch_timer.stop()
         if self.midi_thread:
             self.midi_thread.stop()
             self.midi_thread = None
@@ -226,7 +331,15 @@ class InstallMode(QWidget):
     def closeEvent(self, event):
         self.close_and_stop()
         event.accept()
-        
+
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Escape:
             self.close_and_stop()
+        elif event.key() in (Qt.Key_Right, Qt.Key_Up):
+            self.step_year(1)
+            if hasattr(self, 'year_hud') and self.year_hud:
+                self.year_hud.release_pitchwheel()
+        elif event.key() in (Qt.Key_Left, Qt.Key_Down):
+            self.step_year(-1)
+            if hasattr(self, 'year_hud') and self.year_hud:
+                self.year_hud.release_pitchwheel()

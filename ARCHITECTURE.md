@@ -52,6 +52,7 @@ The primary runtime environment for the exhibition.
   - On `note_on`, matches the note in `config.json` and calls `PlayerEngine.trigger_note()`.
   - On `note_off`, calls `PlayerEngine.release_note()`.
   - On `control_change`, modifies the geometry of the most recently triggered active voice (`get_last_active_layer()`), generating ghost frames if moved significantly.
+  - On `pitchwheel`, switches folders/years (UP = next year, DOWN = previous year, infinite loop). Features progressive acceleration (single step on tap, accelerating repeat when held) and displays the folder name in a centered cinematic HUD overlay (`YearHUDOverlay`) with scale punch and fade-out animations.
 
 ## Data Flow (Live Polyphonic Playback)
 1. User selects a year from the combobox in **Install Mode**.

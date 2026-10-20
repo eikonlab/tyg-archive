@@ -57,6 +57,7 @@ class MidiListener(QThread):
     note_on_signal = pyqtSignal(int, int) # note, velocity
     note_off_signal = pyqtSignal(int)     # note
     cc_signal = pyqtSignal(int, int, int) # channel, control, value
+    pitchwheel_signal = pyqtSignal(int, int) # channel, pitch (-8192 to 8191)
     log_signal = pyqtSignal(str) # log messages
     
     def __init__(self, port_name):
@@ -101,6 +102,10 @@ class MidiListener(QThread):
                     elif msg.type == 'control_change':
                         self.log_signal.emit(f"MIDI In -> CC: {msg.control} (Ch {msg.channel}), Val: {msg.value}")
                         self.cc_signal.emit(msg.channel, msg.control, msg.value)
+                    elif msg.type == 'pitchwheel':
+                        ch = getattr(msg, 'channel', 0)
+                        self.log_signal.emit(f"MIDI In -> Pitch: {msg.pitch} (Ch {ch})")
+                        self.pitchwheel_signal.emit(ch, msg.pitch)
                 else:
                     self.msleep(10)
         except Exception as e:
