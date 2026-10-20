@@ -7,8 +7,10 @@ from core.midi_handler import MidiListener
 from ui.year_hud import YearHUDOverlay
 
 class InstallMode(QWidget):
-    def __init__(self):
+    def __init__(self, parent_launcher=None):
         super().__init__()
+        self.parent_launcher = parent_launcher
+        self._is_closing = False
         self.setWindowTitle("Installation Mode")
         self.showFullScreen()
         self.setStyleSheet("background-color: black; color: white;")
@@ -327,14 +329,53 @@ class InstallMode(QWidget):
             self.year_hud.raise_()
 
     def close_and_stop(self):
-        if hasattr(self, '_pitch_timer') and self._pitch_timer:
-            self._pitch_timer.stop()
-        if self.midi_thread:
-            self.midi_thread.stop()
+        if getattr(self, '_is_closing', False):
+            return
+        self._is_closing = True
+
+        # 1. Quitter le plein écran immédiatement pour éviter l'écran noir sous macOS
+        try:
+            self.showNormal()
+        except Exception:
+            pass
+
+        # 2. Stopper les timers
+        try:
+            if hasattr(self, '_pitch_timer') and self._pitch_timer:
+                self._pitch_timer.stop()
+        except Exception:
+            pass
+
+        # 3. Stopper le thread MIDI
+        if getattr(self, 'midi_thread', None):
+            try:
+                self.midi_thread.stop()
+            except Exception:
+                pass
             self.midi_thread = None
-        if hasattr(self, 'engine'):
-            self.engine.cleanup()
-        self.close()
+
+        # 4. Nettoyer et libérer le moteur de lecture
+        if hasattr(self, 'engine') and self.engine:
+            try:
+                self.engine.cleanup()
+            except Exception:
+                pass
+            self.engine = None
+
+        # 5. Fermer cette fenêtre
+        try:
+            self.close()
+        except Exception:
+            pass
+
+        # 6. Réactiver la fenêtre principale (Launcher)
+        if getattr(self, 'parent_launcher', None):
+            try:
+                self.parent_launcher.showNormal()
+                self.parent_launcher.raise_()
+                self.parent_launcher.activateWindow()
+            except Exception:
+                pass
 
     def closeEvent(self, event):
         self.close_and_stop()

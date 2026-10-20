@@ -1,8 +1,17 @@
+import os
 import sys
 from PyQt5.QtWidgets import QApplication, QMainWindow, QPushButton, QVBoxLayout, QWidget
 from ui.settings import SettingsWindow
 from ui.prep_mode import PrepMode
 from ui.install_mode import InstallMode
+
+def setup_crash_proof_hooks():
+    """Intercepte les exceptions non gérées pour éviter le crash SIGABRT brutal de PyQt5."""
+    def excepthook(exc_type, exc_value, exc_traceback):
+        import traceback
+        err_msg = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+        print(f"[CRASH PREVENTED] Exception interceptée sans interruption de l'app:\n{err_msg}", file=sys.stderr)
+    sys.excepthook = excepthook
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -37,7 +46,7 @@ class MainWindow(QMainWindow):
             QWidget {
                 background-color: #1e1e1e;
                 color: #e0e0e0;
-                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+                font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
             }
             QPushButton {
                 background-color: #2d2d2d;
@@ -72,7 +81,7 @@ class MainWindow(QMainWindow):
             self.prep_window.raise_()
             self.prep_window.activateWindow()
             return
-        self.prep_window = PrepMode()
+        self.prep_window = PrepMode(parent_launcher=self)
         self.prep_window.show()
 
     def open_install(self):
@@ -85,7 +94,7 @@ class MainWindow(QMainWindow):
             self.install_window.raise_()
             self.install_window.activateWindow()
             return
-        self.install_window = InstallMode()
+        self.install_window = InstallMode(parent_launcher=self)
         self.install_window.show()
 
     def open_settings(self):
@@ -98,18 +107,31 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         if self.prep_window:
-            self.prep_window.close()
+            try:
+                self.prep_window.close()
+            except Exception:
+                pass
             self.prep_window = None
         if self.install_window:
-            self.install_window.close_and_stop()
+            try:
+                self.install_window.close_and_stop()
+            except Exception:
+                pass
             self.install_window = None
         if self.settings_window:
-            self.settings_window.close()
+            try:
+                self.settings_window.close()
+            except Exception:
+                pass
             self.settings_window = None
         event.accept()
+        QApplication.quit()
 
 if __name__ == "__main__":
+    setup_crash_proof_hooks()
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()
-    sys.exit(app.exec_())
+    exit_code = app.exec_()
+    # Arrêt immédiat et propre : empêche tout thread C (CoreMIDI / libvlc) résiduel de bloquer sous macOS
+    os._exit(exit_code)

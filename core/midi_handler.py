@@ -110,7 +110,7 @@ class MidiListener(QThread):
                     self.msleep(10)
         except Exception as e:
             self.log_signal.emit(f"Erreur MIDI: {e}")
-            print(f"Erreur MIDI: {e}")
+            print(f"[MIDI] Erreur interceptée: {e}")
         finally:
             if self._port:
                 try:
@@ -119,15 +119,20 @@ class MidiListener(QThread):
                 except Exception:
                     pass
                 self._port = None
-            
+
     def stop(self):
+        """Arrêt propre et non bloquant du thread MIDI."""
         self.running = False
-        if self._port:
-            try:
-                if not getattr(self._port, 'closed', False):
-                    self._port.close()
-            except Exception:
-                pass
-            self._port = None
         self.quit()
-        self.wait(2000)
+        # Attendre que la boucle de run() se termine et ferme le port elle-même
+        if not self.wait(500):
+            # Si le thread tarde à s'arrêter (ex: CoreMIDI suspendu)
+            if self._port:
+                try:
+                    if not getattr(self._port, 'closed', False):
+                        self._port.close()
+                except Exception:
+                    pass
+                self._port = None
+            self.terminate()
+            self.wait(200)

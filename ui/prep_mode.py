@@ -122,8 +122,9 @@ class DroppableNotesTable(QTableWidget):
 
 
 class PrepMode(QWidget):
-    def __init__(self):
+    def __init__(self, parent_launcher=None):
         super().__init__()
+        self.parent_launcher = parent_launcher
         self.setWindowTitle("TYG Archives - Mode Préparation (Media Pool, Clavier & Trimmer)")
         self.resize(1380, 850)
         
@@ -1252,10 +1253,49 @@ class PrepMode(QWidget):
         QTimer.singleShot(4000, lambda: self.lbl_save_status.setText(""))
 
     def closeEvent(self, event):
-        """Nettoyage des threads et instances VLC à la fermeture."""
-        self._stop_playback()
-        if self.midi_listener:
-            self.midi_listener.stop()
+        """Nettoyage des threads et instances VLC à la fermeture en toute sécurité."""
+        try:
+            self._stop_playback()
+        except Exception:
+            pass
+        if getattr(self, 'playback_timer', None):
+            try:
+                self.playback_timer.stop()
+            except Exception:
+                pass
+        if getattr(self, 'midi_listener', None):
+            try:
+                self.midi_listener.stop()
+            except Exception:
+                pass
             self.midi_listener = None
-        self.vlc_player.release()
+        if getattr(self, 'vlc_player', None):
+            try:
+                if sys.platform == "darwin":
+                    self.vlc_player.set_nsobject(0)
+                elif sys.platform.startswith("linux"):
+                    self.vlc_player.set_xwindow(0)
+                elif sys.platform == "win32":
+                    self.vlc_player.set_hwnd(0)
+            except Exception:
+                pass
+            try:
+                self.vlc_player.release()
+            except Exception:
+                pass
+            self.vlc_player = None
+        if getattr(self, 'vlc_instance', None):
+            try:
+                self.vlc_instance.release()
+            except Exception:
+                pass
+            self.vlc_instance = None
+
+        if getattr(self, 'parent_launcher', None):
+            try:
+                self.parent_launcher.showNormal()
+                self.parent_launcher.raise_()
+                self.parent_launcher.activateWindow()
+            except Exception:
+                pass
         event.accept()

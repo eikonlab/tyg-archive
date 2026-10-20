@@ -1,20 +1,20 @@
 from PyQt5.QtWidgets import QWidget
 from PyQt5.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, pyqtProperty, QEvent, QRectF
-from PyQt5.QtGui import QPainter, QFont, QColor
+from PyQt5.QtGui import QPainter, QFont, QColor, QFontMetrics, QPainterPath
 
 
 class YearHUDOverlay(QWidget):
     """
     Overlay plein écran pour afficher le dossier / l'année sélectionnée en grand
     au centre du canevas vidéo.
-    Comporte une typographie cinématographique grand format avec halo sombre haute lisibilité,
+    Comporte une typographie cinématographique grand format avec badge sombre translucide,
     une animation 'scale punch' à chaque cran et un fondu progressif ('fade-out').
     """
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        # N'intercepte pas les clics souris
         self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setStyleSheet("background: transparent;")
 
         if parent:
@@ -32,7 +32,7 @@ class YearHUDOverlay(QWidget):
         self.fade_anim = QPropertyAnimation(self, b"opacity")
         self.fade_anim.finished.connect(self._on_fade_finished)
 
-        # Délai de maintien après relâchement (1 seconde)
+        # Délai de maintien après relâchement (1.2 seconde)
         self.fade_timer = QTimer(self)
         self.fade_timer.setSingleShot(True)
         self.fade_timer.timeout.connect(self._start_fade_out)
@@ -42,8 +42,9 @@ class YearHUDOverlay(QWidget):
     def eventFilter(self, obj, event):
         """Ajuste automatiquement la taille dès que le canevas parent change de dimensions."""
         if obj == self.parent() and event.type() == QEvent.Resize:
-            self.setGeometry(self.parent().rect())
-            self.raise_()
+            if self.parent():
+                self.setGeometry(self.parent().rect())
+                self.raise_()
         return super().eventFilter(obj, event)
 
     @pyqtProperty(float)
@@ -77,10 +78,10 @@ class YearHUDOverlay(QWidget):
         self.show()
         self.raise_()
 
-        # Animation punch: zoom dynamique (1.25 -> 1.0)
+        # Animation punch: zoom dynamique (1.20 -> 1.0)
         self.scale_anim.stop()
-        self.scale_anim.setDuration(180)
-        self.scale_anim.setStartValue(1.25)
+        self.scale_anim.setDuration(160)
+        self.scale_anim.setStartValue(1.20)
         self.scale_anim.setEndValue(1.0)
         self.scale_anim.setEasingCurve(QEasingCurve.OutCubic)
         self.scale_anim.start()
@@ -96,14 +97,14 @@ class YearHUDOverlay(QWidget):
         self.update()
 
     def release_pitchwheel(self):
-        """Appelé lorsque la molette revient dans la zone neutre (démarre le décompte de 1s)."""
+        """Appelé lorsque la molette revient dans la zone neutre (démarre le décompte de 1.2s)."""
         self.fade_timer.stop()
-        self.fade_timer.start(1000)
+        self.fade_timer.start(1200)
 
     def _start_fade_out(self):
-        """Lance le fondu en sortie sur 400ms."""
+        """Lance le fondu en sortie sur 450ms."""
         self.fade_anim.stop()
-        self.fade_anim.setDuration(400)
+        self.fade_anim.setDuration(450)
         self.fade_anim.setStartValue(self._opacity)
         self.fade_anim.setEndValue(0.0)
         self.fade_anim.setEasingCurve(QEasingCurve.InQuad)
@@ -118,30 +119,53 @@ class YearHUDOverlay(QWidget):
         if self._opacity <= 0.001 or not self._text:
             return
 
+        w = float(self.width())
+        h = float(self.height())
+        if w < 10 or h < 10:
+            return
+
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, True)
         painter.setRenderHint(QPainter.TextAntialiasing, True)
 
-        # Taille de police généreuse (environ 18% de la hauteur du canevas, min 72px)
-        font_size = max(72, int(self.height() * 0.18))
-        font = QFont("-apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif", font_size, QFont.Bold)
-        font.setLetterSpacing(QFont.AbsoluteSpacing, 4)
-        painter.setFont(font)
-
-        w = float(self.width())
-        h = float(self.height())
         cx = w / 2.0
         cy = h / 2.0
 
         painter.translate(cx, cy)
         painter.scale(self._scale, self._scale)
 
+        # Taille de police généreuse (environ 16% de la hauteur du canevas, min 64px, max 160px)
+        font_size = max(64, min(160, int(h * 0.16)))
+        font = QFont("Helvetica Neue", font_size, QFont.Bold)
+        font.setStyleStrategy(QFont.PreferAntialias)
+        font.setLetterSpacing(QFont.AbsoluteSpacing, 4)
+        painter.setFont(font)
+
+        fm = QFontMetrics(font)
+        text_rect = fm.boundingRect(self._text)
+        text_w = text_rect.width()
+        text_h = text_rect.height()
+
+        # Badge d'arrière-plan arrondi pour une visibilité absolue sur n'importe quel fond
+        pad_x = max(40, int(font_size * 0.5))
+        pad_y = max(20, int(font_size * 0.25))
+        badge_w = text_w + pad_x * 2
+        badge_h = text_h + pad_y * 2
+        badge_rect = QRectF(-badge_w / 2.0, -badge_h / 2.0, badge_w, badge_h)
+
+        # Fond sombre translucide
+        bg_alpha = int(190 * self._opacity)
+        painter.setBrush(QColor(12, 12, 14, bg_alpha))
+        border_alpha = int(60 * self._opacity)
+        painter.setPen(QColor(255, 255, 255, border_alpha))
+        painter.drawRoundedRect(badge_rect, 20.0, 20.0)
+
         draw_rect = QRectF(-w / 2.0, -h / 2.0, w, h)
 
-        # Halo d'ombre multi-passes prononcé pour contraste parfait sur vidéo sombre ou claire
-        shadow_alpha = int(200 * self._opacity)
+        # Halo d'ombre sombre sous le texte
+        shadow_alpha = int(220 * self._opacity)
         painter.setPen(QColor(0, 0, 0, shadow_alpha))
-        for dx, dy in [(0, 4), (0, -3), (3, 3), (-3, 3), (0, 8), (0, 12), (0, -4)]:
+        for dx, dy in [(0, 3), (2, 2), (-2, 2), (0, 6)]:
             painter.drawText(draw_rect.translated(dx, dy), Qt.AlignCenter, self._text)
 
         # Texte principal blanc éclatant

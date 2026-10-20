@@ -2,6 +2,7 @@ import sys
 import os
 import time
 import tempfile
+import shutil
 import vlc
 from PyQt5.QtWidgets import QWidget, QLabel
 from PyQt5.QtCore import QRect, QTimer, Qt
@@ -252,35 +253,40 @@ class VoiceSlot:
         _log(f"Slot-{self.slot_id}", f"⏹ Slot libéré et éteint")
 
     def take_snapshot(self, snap_dir, counter):
-        """Prend un snapshot VLC pour rafraîchir le live_label."""
-        state = self.player.get_state()
-        if state not in (vlc.State.Playing, vlc.State.Paused):
-            return None
-            
-        snap_path = os.path.join(snap_dir, f"snap_{self.slot_id}_{counter}.png")
-        res = self.player.video_take_snapshot(0, snap_path, 0, 0)
-        if res != 0:
-            return None
-            
-        # Courte attente non bloquante de fichier (max 25ms)
-        for _ in range(5):
-            if os.path.exists(snap_path) and os.path.getsize(snap_path) > 0:
-                break
-            time.sleep(0.005)
-            
-        if not os.path.exists(snap_path) or os.path.getsize(snap_path) == 0:
-            return None
-            
-        pixmap = QPixmap(snap_path)
+        """Prend un snapshot VLC pour rafraîchir le live_label de manière sécurisée."""
         try:
-            os.remove(snap_path)
-        except OSError:
-            pass
-            
-        if pixmap.isNull():
+            if not hasattr(self, 'player') or not self.player:
+                return None
+            state = self.player.get_state()
+            if state not in (vlc.State.Playing, vlc.State.Paused):
+                return None
+                
+            snap_path = os.path.join(snap_dir, f"snap_{self.slot_id}_{counter}.png")
+            res = self.player.video_take_snapshot(0, snap_path, 0, 0)
+            if res != 0:
+                return None
+                
+            # Courte attente non bloquante de fichier (max 25ms)
+            for _ in range(5):
+                if os.path.exists(snap_path) and os.path.getsize(snap_path) > 0:
+                    break
+                time.sleep(0.005)
+                
+            if not os.path.exists(snap_path) or os.path.getsize(snap_path) == 0:
+                return None
+                
+            pixmap = QPixmap(snap_path)
+            try:
+                os.remove(snap_path)
+            except OSError:
+                pass
+                
+            if pixmap.isNull():
+                return None
+                
+            return pixmap
+        except Exception as e:
             return None
-            
-        return pixmap
 
     # Interface de compatibilité CC (scale / position X/Y)
     @property
@@ -291,9 +297,25 @@ class VoiceSlot:
         self.live_label.setGeometry(QRect(x, y, w, h))
 
     def cleanup(self):
-        self.stop()
+        try:
+            self.stop()
+        except Exception:
+            pass
         if hasattr(self, 'player') and self.player:
-            self.player.release()
+            try:
+                # Détacher le NSView Cocoa avant de libérer le player sous macOS
+                if sys.platform == "darwin":
+                    self.player.set_nsobject(0)
+                elif sys.platform.startswith("linux"):
+                    self.player.set_xwindow(0)
+                elif sys.platform == "win32":
+                    self.player.set_hwnd(0)
+            except Exception:
+                pass
+            try:
+                self.player.release()
+            except Exception as e:
+                _log(f"Slot-{self.slot_id}", f"Erreur libération player: {e}")
             self.player = None
 
 
@@ -410,51 +432,54 @@ class PlayerEngine:
 
     def _refresh_active_videos(self):
         """Timer : rafraîchit les snapshots de tous les slots vidéo actifs."""
-        for slot in self.slots:
-            if not slot.is_active or slot.media_type != "video":
-                continue
-                
-            # Vérifier l'atteinte du OUT-point
-            if slot.out_point > slot.in_point:
-                curr_ms = slot.player.get_time()
-                if curr_ms > 0 and curr_ms >= int(slot.out_point * 1000):
+        try:
+            for slot in self.slots:
+                if not slot.is_active or slot.media_type != "video":
+                    continue
+                    
+                # Vérifier l'atteinte du OUT-point
+                if slot.out_point > slot.in_point:
+                    curr_ms = slot.player.get_time()
+                    if curr_ms > 0 and curr_ms >= int(slot.out_point * 1000):
+                        if not slot.is_paused_on_out:
+                            # Capture finale sur l'out-point puis pause
+                            self._snap_counter += 1
+                            pixmap = slot.take_snapshot(self._snap_dir, self._snap_counter)
+                            if pixmap:
+                                slot.live_label.setPixmap(pixmap)
+                            slot.pause_on_out()
+                        continue
+                        
+                # Si le lecteur est arrivé à la fin physique du média
+                if slot.player.get_state() == vlc.State.Ended:
                     if not slot.is_paused_on_out:
-                        # Capture finale sur l'out-point puis pause
-                        self._snap_counter += 1
-                        pixmap = slot.take_snapshot(self._snap_dir, self._snap_counter)
-                        if pixmap:
-                            slot.live_label.setPixmap(pixmap)
                         slot.pause_on_out()
                     continue
                     
-            # Si le lecteur est arrivé à la fin physique du média
-            if slot.player.get_state() == vlc.State.Ended:
-                if not slot.is_paused_on_out:
-                    slot.pause_on_out()
-                continue
-                
-            if slot.is_paused_on_out:
-                continue
-                
-            # Snapshot périodique
-            self._snap_counter += 1
-            pixmap = slot.take_snapshot(self._snap_dir, self._snap_counter)
-            if pixmap is not None:
-                slot.live_label.setPixmap(pixmap)
-                
-                # Ajustement de l'aspect ratio dès la première frame valide reçue
-                if not slot.video_aspect_adjusted:
-                    vw = slot.player.video_get_width()
-                    vh = slot.player.video_get_height()
-                    if vw > 0 and vh > 0:
-                        slot.video_aspect_adjusted = True
-                        aspect = vw / vh
-                        rect = slot.live_label.geometry()
-                        cx = rect.x() + rect.width() / 2
-                        cy = rect.y() + rect.height() / 2
-                        new_w = rect.width()
-                        new_h = int(new_w / aspect)
-                        slot.live_label.setGeometry(QRect(int(cx - new_w / 2), int(cy - new_h / 2), new_w, new_h))
+                if slot.is_paused_on_out:
+                    continue
+                    
+                # Snapshot périodique
+                self._snap_counter += 1
+                pixmap = slot.take_snapshot(self._snap_dir, self._snap_counter)
+                if pixmap is not None:
+                    slot.live_label.setPixmap(pixmap)
+                    
+                    # Ajustement de l'aspect ratio dès la première frame valide reçue
+                    if not slot.video_aspect_adjusted:
+                        vw = slot.player.video_get_width()
+                        vh = slot.player.video_get_height()
+                        if vw > 0 and vh > 0:
+                            slot.video_aspect_adjusted = True
+                            aspect = vw / vh
+                            rect = slot.live_label.geometry()
+                            cx = rect.x() + rect.width() / 2
+                            cy = rect.y() + rect.height() / 2
+                            new_w = rect.width()
+                            new_h = int(new_w / aspect)
+                            slot.live_label.setGeometry(QRect(int(cx - new_w / 2), int(cy - new_h / 2), new_w, new_h))
+        except Exception as e:
+            _log("Engine", f"Erreur rafraîchissement vidéo (récupérée): {e}")
 
     # --- Gestion CC MIDI & Ghosting ---
     
@@ -485,14 +510,32 @@ class PlayerEngine:
         self.trigger_note(0, filepath, in_point=in_point, out_point=0.0, video_width=video_width, video_height=video_height, velocity=velocity)
 
     def cleanup(self):
-        """Arrêt propre et libération des ressources."""
+        """Arrêt propre et libération totale des ressources sans planter."""
         _log("Engine", "Nettoyage complet de l'Engine")
-        if self._live_timer.isActive():
-            self._live_timer.stop()
+        try:
+            if hasattr(self, '_live_timer') and self._live_timer.isActive():
+                self._live_timer.stop()
+        except Exception:
+            pass
+
         for slot in self.slots:
-            slot.cleanup()
+            try:
+                slot.cleanup()
+            except Exception:
+                pass
         self.slots.clear()
         self.active_voice_order.clear()
+
+        # Supprimer le dossier temporaire des snapshots
+        if hasattr(self, '_snap_dir') and self._snap_dir and os.path.exists(self._snap_dir):
+            try:
+                shutil.rmtree(self._snap_dir, ignore_errors=True)
+            except Exception:
+                pass
+
         if hasattr(self, 'vlc_instance') and self.vlc_instance:
-            self.vlc_instance.release()
+            try:
+                self.vlc_instance.release()
+            except Exception:
+                pass
             self.vlc_instance = None
