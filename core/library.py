@@ -10,8 +10,23 @@ VALID_EXTENSIONS = {".mp4", ".mov", ".mkv", ".jpg", ".jpeg", ".png", ".wav"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv"}
 
 
+NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+
+def midi_note_to_name(note: int) -> str:
+    """Convertit un numéro de note MIDI en nom musical (ex: 28 -> 'E0', 60 -> 'C3', 103 -> 'G6')."""
+    if note is None or note < 0 or note > 127:
+        return ""
+    name = NOTE_NAMES[note % 12]
+    octave = (note // 12) - 2
+    return f"{name}{octave}"
+
+_video_info_cache = {}
+
 def _get_video_info(filepath):
-    """Récupère la durée et les dimensions d'une vidéo via ffprobe (avec chemins de secours)."""
+    """Récupère la durée et les dimensions d'une vidéo via ffprobe (avec cache et chemins de secours)."""
+    if filepath in _video_info_cache:
+        return _video_info_cache[filepath]
+        
     ffprobe_paths = ["ffprobe", "/usr/local/bin/ffprobe", "/opt/homebrew/bin/ffprobe", "/opt/ffmpeg/bin/ffprobe"]
     
     for cmd in ffprobe_paths:
@@ -31,12 +46,87 @@ def _get_video_info(filepath):
                         height = int(stream.get("height", 0))
                         break
                         
-                return {"duration": duration, "width": width, "height": height}
+                info = {"duration": duration, "width": width, "height": height}
+                _video_info_cache[filepath] = info
+                return info
         except (FileNotFoundError, subprocess.TimeoutExpired, json.JSONDecodeError, ValueError):
             continue
             
-    return {"duration": 0.0, "width": 0, "height": 0}
+    info = {"duration": 0.0, "width": 0, "height": 0}
+    return info
 
+def get_media_pool(year, config=None):
+    """Retourne la liste des médias uniques disponibles pour l'année donnée."""
+    if config is None:
+        config = load_config()
+    
+    # 1. Priorité au media_pool dédié s'il existe
+    pool = config.get("media_pool", {}).get(str(year))
+    if pool:
+        for m in pool:
+            if m.get("type") == "video" and (m.get("duration", 0) <= 0 or m.get("width", 0) <= 0):
+                info = _get_video_info(m["filepath"])
+                m["duration"] = info["duration"]
+                m["width"] = info["width"]
+                m["height"] = info["height"]
+        return pool
+        
+    # 2. Rétro-compatibilité : déduire le pool depuis la liste d'assignation years[year]
+    existing = config.get("years", {}).get(str(year), [])
+    seen = set()
+    deduced_pool = []
+    for item in existing:
+        fp = item.get("filepath", "")
+        if fp and fp not in seen:
+            seen.add(fp)
+            mtype = item.get("type", "video")
+            w = item.get("width", 0)
+            h = item.get("height", 0)
+            dur = item.get("duration", 0.0)
+            
+            if mtype == "video" and (dur <= 0 or w <= 0 or h <= 0):
+                info = _get_video_info(fp)
+                dur = info["duration"]
+                w = info["width"]
+                h = info["height"]
+                
+            deduced_pool.append({
+                "filepath": fp,
+                "type": mtype,
+                "width": w,
+                "height": h,
+                "duration": dur
+            })
+    return deduced_pool
+
+def generate_slice_points(filepath, duration=None, width=None, height=None):
+    """Génère des points IN et OUT aléatoires pour un clip vidéo en évitant les noirs de début de bande."""
+    if duration is None or duration <= 0 or not width or not height:
+        info = _get_video_info(filepath)
+        dur = info["duration"]
+        w = info["width"]
+        h = info["height"]
+    else:
+        dur = duration
+        w = width
+        h = height
+    
+    if dur > 10:
+        # Éviter le noir de début de bande (présent sur les numérisations VHS/Hi8/U-matic)
+        # On commence au minimum à 8 secondes (ou 5% du clip) pour garantir l'image
+        min_start = min(8.0, dur * 0.05) if dur > 20 else 0.0
+        max_in = dur * 0.75
+        in_p = round(random.uniform(min_start, max_in), 1)
+        
+        # OUT point : au moins 8s de vidéo, jusqu'à 120s ou la fin du clip
+        min_out = min(in_p + 8.0, dur)
+        max_out = min(in_p + 120.0, dur)
+        out_p = round(random.uniform(min_out, max_out), 1)
+        return in_p, out_p, w, h, dur
+    elif dur > 0:
+        return 0.0, round(dur, 1), w, h, dur
+    else:
+        return 0.0, 0.0, w, h, 0.0
 
 def scan_library(root_path):
     years_data = {}
@@ -58,12 +148,14 @@ def scan_library(root_path):
                         filepath = os.path.join(root, f)
                         mtype = "image" if ext in {".jpg", ".jpeg", ".png"} else ("audio" if ext == ".wav" else "video")
                         
+                        info = _get_video_info(filepath) if mtype == "video" else {"duration": 0.0, "width": 0, "height": 0}
+                        
                         years_data[year_dir].append({
                             "filepath": filepath,
                             "type": mtype,
-                            "in_point": 0.0,
-                            "out_point": 0.0,
-                            "midi_note": None
+                            "width": info["width"],
+                            "height": info["height"],
+                            "duration": info["duration"]
                         })
                         
             # Trier les fichiers par nom alphabétique dans chaque année
@@ -73,76 +165,152 @@ def scan_library(root_path):
 
 def sync_library(root_path):
     config = load_config()
-    scanned = scan_library(root_path)
+    scanned_pools = scan_library(root_path)
     
-    # Merge preserving existing midi notes and cue points
-    existing_years = config.get("years", {})
-    
-    for year, files in scanned.items():
+    # Stocker les fichiers scannés dans le media_pool
+    media_pool = config.setdefault("media_pool", {})
+    for year, files in scanned_pools.items():
+        media_pool[year] = files
+        
+    # Conserver les assignations existantes dans years[year]
+    existing_years = config.setdefault("years", {})
+    for year, pool_files in scanned_pools.items():
         if year not in existing_years:
-            existing_years[year] = files
+            # Année nouvellement scannée : créer une assignation séquentielle par défaut
+            existing_years[year] = []
+            note = 28
+            for f in pool_files:
+                in_p, out_p, w, h, dur = generate_slice_points(f["filepath"], f.get("duration"), f.get("width"), f.get("height"))
+                existing_years[year].append({
+                    "midi_note": note,
+                    "filepath": f["filepath"],
+                    "type": f["type"],
+                    "in_point": in_p if f["type"] == "video" else 0.0,
+                    "out_point": out_p if f["type"] == "video" else 0.0,
+                    "width": w,
+                    "height": h
+                })
+                note += 1
+                if note > 103:
+                    break
         else:
-            # Map existing files by path for quick lookup
-            existing_files = {f["filepath"]: f for f in existing_years[year]}
-            merged = []
-            for f in files:
-                if f["filepath"] in existing_files:
-                    merged.append(existing_files[f["filepath"]])
-                else:
-                    merged.append(f)
-            existing_years[year] = merged
+            # Filtrer pour ne garder que les assignations de fichiers qui existent toujours
+            scanned_paths = {f["filepath"] for f in pool_files}
+            cleaned_assignments = [
+                a for a in existing_years[year] 
+                if a.get("filepath") in scanned_paths
+            ]
+            existing_years[year] = cleaned_assignments
             
-    config["years"] = existing_years
     save_config(config)
     return existing_years
 
-def auto_assign_midi(year):
-    """Auto-assigne les notes MIDI et randomise les IN/OUT pour les vidéos."""
+def auto_assign_fill(year, min_note=28, max_note=103):
+    """Assigne en boucle les médias du pool pour remplir toutes les touches de min_note à max_note avec des cues uniques."""
     config = load_config()
-    if year not in config["years"]:
+    pool = get_media_pool(year, config)
+    if not pool:
+        print(f"[Library] Media pool vide pour l'année {year}")
         return
         
-    print(f"[Library] Auto-assign MIDI pour {year} ({len(config['years'][year])} fichiers)")
+    assignments = []
+    pool_len = len(pool)
     
-    note = 28  # Start at E0 (Clavier 76 touches)
-    for f in config["years"][year]:
-        f["midi_note"] = note
-        note += 1
-        if note > 127:
-            break
+    for idx, note in enumerate(range(min_note, max_note + 1)):
+        media = pool[idx % pool_len]
+        fp = media["filepath"]
+        mtype = media.get("type", "video")
         
-        # Randomiser les IN/OUT pour les vidéos
-        ext = os.path.splitext(f["filepath"])[1].lower()
-        
-        # Par défaut, on initialise avec des dimensions nulles
-        f["width"] = 0
-        f["height"] = 0
-        
-        if ext in VIDEO_EXTENSIONS:
-            info = _get_video_info(f["filepath"])
-            duration = info["duration"]
-            f["width"] = info["width"]
-            f["height"] = info["height"]
+        if mtype == "video":
+            in_p, out_p, w, h, dur = generate_slice_points(fp, media.get("duration"), media.get("width"), media.get("height"))
+        else:
+            in_p, out_p, w, h = 0.0, 0.0, media.get("width", 0), media.get("height", 0)
             
-            if duration > 10:
-                # IN point : position aléatoire dans les premiers 80% du clip
-                # pour laisser au moins 20% de clip à jouer
-                max_in = duration * 0.8
-                in_point = round(random.uniform(0, max_in), 1)
-                
-                # OUT point : entre le in_point + 5s et la fin du clip
-                min_out = min(in_point + 5.0, duration)
-                out_point = round(random.uniform(min_out, duration), 1)
-                
-                f["in_point"] = in_point
-                f["out_point"] = out_point
-                print(f"  {os.path.basename(f['filepath'])}: IN={in_point}s OUT={out_point}s (durée={duration:.0f}s) ({f['width']}x{f['height']})")
-            elif duration > 0:
-                # Clip court : on garde le début mais avec un out aléatoire
-                f["in_point"] = 0.0
-                f["out_point"] = round(random.uniform(duration * 0.3, duration), 1)
-                print(f"  {os.path.basename(f['filepath'])}: clip court, IN=0 OUT={f['out_point']}s ({f['width']}x{f['height']})")
-            else:
-                print(f"  {os.path.basename(f['filepath'])}: durée inconnue (ffprobe indisponible?)")
-    
+        assignments.append({
+            "midi_note": note,
+            "filepath": fp,
+            "type": mtype,
+            "in_point": in_p,
+            "out_point": out_p,
+            "width": w,
+            "height": h
+        })
+        
+    config.setdefault("years", {})[str(year)] = assignments
     save_config(config)
+    print(f"[Library] Auto-assign 'Fill' terminé pour {year} ({len(assignments)} notes assignées de {min_note} à {max_note})")
+
+def auto_assign_sequential(year, min_note=28, max_note=103):
+    """Assigne chaque média du pool une seule fois de manière séquentielle."""
+    config = load_config()
+    pool = get_media_pool(year, config)
+    if not pool:
+        print(f"[Library] Media pool vide pour l'année {year}")
+        return
+        
+    assignments = []
+    for idx, media in enumerate(pool):
+        note = min_note + idx
+        if note > max_note:
+            break
+            
+        fp = media["filepath"]
+        mtype = media.get("type", "video")
+        
+        if mtype == "video":
+            in_p, out_p, w, h, dur = generate_slice_points(fp, media.get("duration"), media.get("width"), media.get("height"))
+        else:
+            in_p, out_p, w, h = 0.0, 0.0, media.get("width", 0), media.get("height", 0)
+            
+        assignments.append({
+            "midi_note": note,
+            "filepath": fp,
+            "type": mtype,
+            "in_point": in_p,
+            "out_point": out_p,
+            "width": w,
+            "height": h
+        })
+        
+    config.setdefault("years", {})[str(year)] = assignments
+    save_config(config)
+    print(f"[Library] Auto-assign 'Sequential' terminé pour {year} ({len(assignments)} notes assignées)")
+
+def heal_zero_cues(year=None):
+    """Répare les assignations vidéo qui ont IN=0 et OUT=0 ou des dimensions nulles."""
+    config = load_config()
+    years_to_check = [str(year)] if year else list(config.get("years", {}).keys())
+    repaired_count = 0
+    
+    for y in years_to_check:
+        items = config.get("years", {}).get(y, [])
+        for item in items:
+            if item.get("type") == "video":
+                fp = item.get("filepath", "")
+                in_p = item.get("in_point", 0.0)
+                out_p = item.get("out_point", 0.0)
+                w = item.get("width", 0)
+                h = item.get("height", 0)
+                
+                # Si in=0 et out=0, ou dimensions inconnues
+                if (in_p == 0.0 and out_p == 0.0) or w <= 0 or h <= 0:
+                    new_in, new_out, new_w, new_h, dur = generate_slice_points(fp)
+                    if in_p == 0.0 and out_p == 0.0:
+                        item["in_point"] = new_in
+                        item["out_point"] = new_out
+                    if w <= 0 or h <= 0:
+                        item["width"] = new_w
+                        item["height"] = new_h
+                    repaired_count += 1
+                    
+    if repaired_count > 0:
+        save_config(config)
+        print(f"[Library] {repaired_count} assignations vidéo réparées avec des cues et dimensions valides.")
+    return repaired_count
+
+def auto_assign_midi(year, mode="fill"):
+    """Alias rétro-compatible pour auto-assignation."""
+    if mode == "sequential":
+        auto_assign_sequential(year)
+    else:
+        auto_assign_fill(year)

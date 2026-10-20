@@ -29,19 +29,84 @@ class MainWindow(QMainWindow):
         central_widget.setLayout(layout)
         self.setCentralWidget(central_widget)
 
+        # Style sombre moderne et épuré
+        self.setStyleSheet("""
+            QMainWindow {
+                background-color: #1e1e1e;
+            }
+            QWidget {
+                background-color: #1e1e1e;
+                color: #e0e0e0;
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            }
+            QPushButton {
+                background-color: #2d2d2d;
+                color: #ffffff;
+                border: 1px solid #3d3d3d;
+                border-radius: 6px;
+                padding: 12px 16px;
+                font-size: 13px;
+                font-weight: 500;
+                margin: 4px 0px;
+            }
+            QPushButton:hover {
+                background-color: #3d3d3d;
+                border-color: #555555;
+            }
+            QPushButton:pressed {
+                background-color: #1a1a1a;
+            }
+        """)
+
+        self.prep_window = None
+        self.install_window = None
+        self.settings_window = None
+
     def open_prep(self):
         print("Ouverture du mode préparation...")
+        # Fermer le mode installation s'il tourne pour libérer le port MIDI
+        if self.install_window and self.install_window.isVisible():
+            self.install_window.close_and_stop()
+            self.install_window = None
+        if self.prep_window and self.prep_window.isVisible():
+            self.prep_window.raise_()
+            self.prep_window.activateWindow()
+            return
         self.prep_window = PrepMode()
         self.prep_window.show()
 
     def open_install(self):
         print("Ouverture du mode installation...")
+        # Fermer le mode préparation s'il tourne pour libérer le port MIDI
+        if self.prep_window and self.prep_window.isVisible():
+            self.prep_window.close()
+            self.prep_window = None
+        if self.install_window and self.install_window.isVisible():
+            self.install_window.raise_()
+            self.install_window.activateWindow()
+            return
         self.install_window = InstallMode()
         self.install_window.show()
 
     def open_settings(self):
+        if self.settings_window and self.settings_window.isVisible():
+            self.settings_window.raise_()
+            self.settings_window.activateWindow()
+            return
         self.settings_window = SettingsWindow()
         self.settings_window.show()
+
+    def closeEvent(self, event):
+        if self.prep_window:
+            self.prep_window.close()
+            self.prep_window = None
+        if self.install_window:
+            self.install_window.close_and_stop()
+            self.install_window = None
+        if self.settings_window:
+            self.settings_window.close()
+            self.settings_window = None
+        event.accept()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

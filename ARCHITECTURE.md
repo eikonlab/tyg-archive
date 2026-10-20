@@ -39,7 +39,10 @@ Allows the user to configure hardware inputs.
 - Provides a "Learn" feature. When activated, it spawns a temporary `MidiListener` thread that listens for the next CC message and binds it to a specific control (Scale, Pos X, or Pos Y) in `config.json`.
 
 ### 3. `prep_mode.py` (Preparation Mode)
-The interface for the `library.py` functions. It lets the operator select a folder to scan and allows triggering the auto-assignment of MIDI notes for specific years.
+An advanced 3-column workstation designed to curate and map media for the 76-key keyboard:
+- **Column 1 (Media Pool & Years):** Discovers all available media for a selected year, displays usage count badges (`[x2]`, `[-]`), and supports drag-and-drop as well as filtering.
+- **Column 2 (76-Key Keyboard Map):** Displays the complete range of 76 notes (Note 28 / E0 to Note 103 / G6). Supports drag-and-drop media assignment, note duplication for slicing sub-cues, clearing assignments, batch auto-assignment ("Fill All 76 Keys" and "1-to-1 Sequential"), and real-time MIDI keyboard auditioning.
+- **Column 3 (VLC Player, Scrubber & Cue Trimmer):** Embedded VLC decoder with interactive timeline scrubber (`CueSlider` highlighting `[IN -> OUT]`), 0.1s spinboxes, keyboard shortcuts (`Space` for Play/Pause, `I` for Mark IN, `O` for Mark OUT), and dedicated "Audition Cue" playback.
 
 ### 4. `install_mode.py` (Installation Mode)
 The primary runtime environment for the exhibition.

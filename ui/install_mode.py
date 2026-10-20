@@ -22,6 +22,7 @@ class InstallMode(QWidget):
         self.year_combo = QComboBox()
         self.year_combo.addItems(self.years)
         self.year_combo.setMinimumWidth(150)
+        self.year_combo.currentIndexChanged.connect(self._on_year_changed)
         self.year_combo.setStyleSheet("""
             QComboBox {
                 background-color: #333; 
@@ -86,6 +87,16 @@ class InstallMode(QWidget):
         scrollbar = self.debug_log.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
             
+    def _on_year_changed(self):
+        year = self.year_combo.currentText()
+        self.log_debug(f"Année sélectionnée: {year}")
+        if hasattr(self, 'engine'):
+            for slot in self.engine.slots:
+                if slot.is_active:
+                    slot.stop()
+            self.engine.active_voice_order.clear()
+            self.engine._update_audio_volumes()
+
     def on_midi_note_on(self, note, velocity):
         import time
         now = time.time()
@@ -99,9 +110,11 @@ class InstallMode(QWidget):
         if not year:
             return
         
-        media_list = self.config["years"].get(year, [])
+        media_list = self.config.get("years", {}).get(year, [])
+        found = False
         for media in media_list:
             if media.get("midi_note") == note:
+                found = True
                 self.log_debug(f"Action: Note On {note} -> {media['filepath']} (In: {media.get('in_point', 0.0)}, Out: {media.get('out_point', 0.0)})")
                 self.engine.trigger_note(
                     note,
@@ -113,6 +126,8 @@ class InstallMode(QWidget):
                     velocity
                 )
                 break
+        if not found:
+            self.log_debug(f"Note {note} reçue (Vel: {velocity}) mais aucun média assigné pour l'année {year}")
 
     def on_midi_note_off(self, note):
         self.log_debug(f"Action: Note Off {note}")
@@ -203,13 +218,14 @@ class InstallMode(QWidget):
     def close_and_stop(self):
         if self.midi_thread:
             self.midi_thread.stop()
+            self.midi_thread = None
         if hasattr(self, 'engine'):
             self.engine.cleanup()
         self.close()
-        
-        app = QApplication.instance()
-        if app:
-            app.quit()
+
+    def closeEvent(self, event):
+        self.close_and_stop()
+        event.accept()
         
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Escape:

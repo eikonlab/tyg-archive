@@ -131,4 +131,5 @@ class SettingsWindow(QWidget):
     def closeEvent(self, event):
         if self.midi_thread:
             self.midi_thread.stop()
+            self.midi_thread = None
         super().closeEvent(event)

@@ -24,6 +24,7 @@ TYG Archives is an interactive, MIDI-controlled media playback installation. Bui
 ## Project Structure
 
 Your media files should be organized by year in a root directory. For example:
+
 ```text
 MyMediaLibrary/
 ├── 2010/
